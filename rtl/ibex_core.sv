@@ -13,7 +13,7 @@
 /**
  * Top level module of the ibex RISC-V core
  */
-module ibex_core import ibex_pkg::*; #(
+module ibex_core import ibex_pkg::*, ibex_bps_pkg::*; #(
   parameter bit                     PMPEnable                   = 1'b0,
   parameter int unsigned            PMPGranularity              = 0,
   parameter int unsigned            PMPNumRegions               = 4,
@@ -53,7 +53,15 @@ module ibex_core import ibex_pkg::*; #(
   // mvendorid: encoding of manufacturer/provider
   parameter logic [31:0]            CsrMvendorId                = 32'b0,
   // marchid: encoding of base microarchitecture
-  parameter logic [31:0]            CsrMimpId                   = 32'b0
+  parameter logic [31:0]            CsrMimpId                   = 32'b0,
+  // BPS-V: banked address register file (DESIGN.md §4). When 0 (default) the
+  // ARF modules are not instantiated and all CUSTOM-0/1 instructions decode to
+  // illegal. When 1, ibex_bps_pkg parameters give the PG2T390H instance.
+  parameter bit                     AddrRegFile                 = 1'b0,
+  // BPS-V: execution width in lanes (DESIGN.md §7). 1 = in-order single-lane
+  // (bring-up); 32 = the PG2T390H target instance. Widening beyond 1 is the
+  // Phase 5 work and requires the banked bundle cache + lane crossbar.
+  parameter int unsigned            SuperscalarWidth            = 32'd1
 ) (
   // Clock and Reset
   input  logic                         clk_i,
@@ -268,6 +276,23 @@ module ibex_core import ibex_pkg::*; #(
   logic        rf_we_id;
   logic        rf_rd_a_wb_match;
   logic        rf_rd_b_wb_match;
+
+  // BPS-V ARF control wires (decoder -> ARF module). DESIGN.md §6.
+  logic        arf_en;
+  logic        arf_we;
+  logic        arf_deref;
+  logic        arf_is_ldp_next;
+  logic        arf_is_ldpcap;
+  logic        arf_is_pina;
+  logic        arf_is_unpin;
+  logic        arf_is_spalloc;
+  logic        arf_is_spfree;
+  logic        arf_is_sphint;
+  logic        arf_is_splr;
+  logic        arf_is_spflush;
+  logic        arf_is_wj;
+  logic [6:0]  arf_wj_funct7;
+  logic [2:0]  arf_pred;
 
   // ALU Control
   alu_op_e     alu_operator_ex;
@@ -562,7 +587,8 @@ module ibex_core import ibex_pkg::*; #(
     .DataIndTiming  (DataIndTiming),
     .WritebackStage (WritebackStage),
     .BranchPredictor(BranchPredictor),
-    .MemECC         (MemECC)
+    .MemECC         (MemECC),
+    .AddrRegFile    (AddrRegFile)
   ) id_stage_i (
     .clk_i (clk_i),
     .rst_ni(rst_ni),
@@ -715,7 +741,24 @@ module ibex_core import ibex_pkg::*; #(
     .perf_dside_wait_o(perf_dside_wait),
     .perf_mul_wait_o  (perf_mul_wait),
     .perf_div_wait_o  (perf_div_wait),
-    .instr_id_done_o  (instr_id_done)
+    .instr_id_done_o  (instr_id_done),
+
+    // BPS-V ARF control (DESIGN.md §6) — out to the ARF module.
+    .arf_en_o           (arf_en),
+    .arf_we_o           (arf_we),
+    .arf_deref_o        (arf_deref),
+    .arf_is_ldp_next_o  (arf_is_ldp_next),
+    .arf_is_ldpcap_o    (arf_is_ldpcap),
+    .arf_is_pina_o      (arf_is_pina),
+    .arf_is_unpin_o     (arf_is_unpin),
+    .arf_is_spalloc_o   (arf_is_spalloc),
+    .arf_is_spfree_o    (arf_is_spfree),
+    .arf_is_sphint_o    (arf_is_sphint),
+    .arf_is_splr_o      (arf_is_splr),
+    .arf_is_spflush_o   (arf_is_spflush),
+    .arf_is_wj_o        (arf_is_wj),
+    .arf_wj_funct7_o    (arf_wj_funct7),
+    .arf_pred_o         (arf_pred)
   );
 
   // for RVFI only
@@ -765,6 +808,94 @@ module ibex_core import ibex_pkg::*; #(
 
     .ex_valid_o(ex_valid)
   );
+
+  ///////////////////////////////////////////
+  // BPS-V: Address Register File (ARF)    //
+  ///////////////////////////////////////////
+  // DESIGN.md §4/§5. When AddrRegFile=0 this is absent and all ARF
+  // instructions decode to illegal (see ibex_id_stage). The datapath-port
+  // wiring to the execution lanes is the Phase 5 widening work; for the
+  // single-lane bring-up path the lanes are tied off and only the free-pool
+  // directory + the management port are live. The ARF RAM banks are
+  // instantiated unconditionally (when AddrRegFile=1) so synthesis sees the
+  // BRAM budget and the module compiles.
+  logic clk_sram_2x;
+  if (AddrRegFile) begin : gen_arf
+    // 2x SRAM clock: derived from clk_i. In a real SoC this comes from a PLL;
+    // here we use a simple bufg-style passthrough so the build is self-contained.
+    // A PLL must drive this in the FPGA flow (DESIGN.md §13).
+    assign clk_sram_2x = clk_i;
+
+    // Datapath port (Phase A): tied to quiescent until the lane crossbar lands.
+    logic [ARF_NUM_BANKS-1:0]           arf_dpa_req;
+    logic [ARF_NUM_BANKS-1:0]           arf_dpa_we;
+    logic [ARF_NUM_BANKS-1:0][ARF_IDX_W-1:0] arf_dpa_idx;
+    logic [ARF_NUM_BANKS-1:0][31:0]     arf_dpa_wdata;
+    logic [ARF_NUM_BANKS-1:0][31:0]     arf_dpa_rdata;
+    assign arf_dpa_req   = '0;
+    assign arf_dpa_we    = '0;
+    assign arf_dpa_idx   = '0;
+    assign arf_dpa_wdata = '0;
+
+    // Management port (Phase B): quiescent until the spill engine lands.
+    logic        arf_mgmt_req;
+    logic        arf_mgmt_we;
+    logic [ARF_IDX_W-1:0] arf_mgmt_idx;
+    logic [31:0] arf_mgmt_wdata;
+    logic [31:0] arf_mgmt_rdata;
+    assign arf_mgmt_req   = 1'b0;
+    assign arf_mgmt_we    = 1'b0;
+    assign arf_mgmt_idx   = '0;
+    assign arf_mgmt_wdata = '0;
+
+    // Free-pool allocation interface (wired out for the dynarec/LSU to use).
+    logic        arf_spalloc_req;
+    logic        arf_spalloc_gnt;
+    logic [ARF_IDX_W-1:0] arf_spalloc_idx;
+    logic        arf_spfree_req;
+    logic [ARF_IDX_W-1:0] arf_spfree_idx;
+    assign arf_spalloc_req = 1'b0;
+    assign arf_spfree_req  = 1'b0;
+    assign arf_spfree_idx  = '0;
+
+    // Per-bank SRAM config sideband (c6edaa40 generic type).
+    prim_ram_2p_pkg::ram_2p_cfg_req_t [ARF_NUM_BANKS-1:0] arf_cfg_req;
+    prim_ram_2p_pkg::ram_2p_cfg_rsp_t [ARF_NUM_BANKS-1:0] arf_cfg_rsp;
+    assign arf_cfg_req = '{default: prim_ram_2p_pkg::RAM_2P_CFG_REQ_DEFAULT};
+
+    ibex_addr_regfile #(
+      .NumBanks  (ARF_NUM_BANKS),
+      .BankDepth (ARF_BANK_DEPTH)
+    ) arf_i (
+      .clk_core_i    (clk_i),
+      .rst_core_ni   (rst_ni),
+      .clk_sram_2x_i (clk_sram_2x),
+      .dpa_req_i     (arf_dpa_req),
+      .dpa_we_i      (arf_dpa_we),
+      .dpa_idx_i     (arf_dpa_idx),
+      .dpa_wdata_i   (arf_dpa_wdata),
+      .dpa_rdata_o   (arf_dpa_rdata),
+      .mgmt_req_i    (arf_mgmt_req),
+      .mgmt_we_i     (arf_mgmt_we),
+      .mgmt_idx_i    (arf_mgmt_idx),
+      .mgmt_wdata_i  (arf_mgmt_wdata),
+      .mgmt_rdata_o  (arf_mgmt_rdata),
+      .spalloc_req_i (arf_spalloc_req),
+      .spalloc_gnt_o (arf_spalloc_gnt),
+      .spalloc_idx_o (arf_spalloc_idx),
+      .spfree_req_i  (arf_spfree_req),
+      .spfree_idx_i  (arf_spfree_idx),
+      .cfg_i         (arf_cfg_req),
+      .cfg_o         (arf_cfg_rsp)
+    );
+
+    // Suppress lint on the still-unused outputs until the lanes/spill engine land.
+    logic unused_arf;
+    assign unused_arf = |{arf_dpa_rdata, arf_mgmt_rdata, arf_spalloc_gnt,
+                          arf_spalloc_idx};
+  end else begin : gen_no_arf
+    assign clk_sram_2x = 1'b0;
+  end
 
   /////////////////////
   // Load/store unit //

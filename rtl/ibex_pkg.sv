@@ -74,7 +74,11 @@ package ibex_pkg;
     OPCODE_BRANCH   = 7'h63,
     OPCODE_JALR     = 7'h67,
     OPCODE_JAL      = 7'h6f,
-    OPCODE_SYSTEM   = 7'h73
+    OPCODE_SYSTEM   = 7'h73,
+    // BPS-V custom opcodes (DESIGN.md §6.1). Reserved in the base ISA; gated
+    // by the AddrRegFile parameter in ibex_core (decode to illegal when 0).
+    OPCODE_CUSTOM_0 = 7'h0b, // ARF datapath: slotr/slotw/pina/unpin/ldp/stp/...
+    OPCODE_CUSTOM_1 = 7'h2b  // ARF mgmt / spill / wait-jump: spalloc/spfree/...
   } opcode_e;
 
 

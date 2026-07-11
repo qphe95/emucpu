@@ -36,6 +36,32 @@ small:
   MHPMCounterNum           : 0
   MHPMCounterWidth         : 40
 
+# BPS-V: the banked-ARF + statically-dispatched (VLIW) core from DESIGN.md.
+# Built on the 'small' 2-stage base (no writeback stage, no branch predictor —
+# the BPS layer removes prediction by construction). ARF/banking/width are RTL
+# parameters not in this YAML schema; they default in ibex_bps_pkg to the
+# PG2T390H instance (ARF=128K, 64 banks, W=32). Extend util/ibex_config.py to
+# surface AddrRegFile/SuperscalarWidth here if config-driven selection is wanted.
+bps:
+  RV32E                    : 0
+  RV32M                    : "ibex_pkg::RV32MFast"
+  RV32B                    : "ibex_pkg::RV32BNone"
+  RV32ZC                   : "ibex_pkg::RV32Zca"
+  RegFile                  : "ibex_pkg::RegFileFF"
+  BranchTargetALU          : 0
+  WritebackStage           : 0
+  ICache                   : 0
+  ICacheECC                : 0
+  ICacheScramble           : 0
+  BranchPredictor          : 0
+  DbgTriggerEn             : 0
+  SecureIbex               : 0
+  PMPEnable                : 0
+  PMPGranularity           : 0
+  PMPNumRegions            : 4
+  MHPMCounterNum           : 0
+  MHPMCounterWidth         : 40
+
 # Configuration to match that used in the OpenTitan project
 opentitan:
   RV32E                    : 0

@@ -95,10 +95,30 @@ module ibex_decoder #(
 
   // jump/branches
   output logic                 jump_in_dec_o,         // jump is being calculated in ALU
-  output logic                 branch_in_dec_o
+  output logic                 branch_in_dec_o,
+
+  // BPS-V ARF control (DESIGN.md §6). Driven only by the CUSTOM-0/1 arms below;
+  // all zero otherwise. ibex_core routes these to ibex_addr_regfile. The slot
+  // index comes from rs1[16:0] (full 17-bit) or imm[11:0] (low 4K, ldpi/stpi).
+  output logic                 arf_en_o,              // instruction accesses the ARF
+  output logic                 arf_we_o,              // ARF slot write (slotw/pina/ldp.next/...)
+  output logic                 arf_deref_o,           // dereferenced mem op (ldp/stp/ldpi/stpi/...)
+  output logic                 arf_is_ldp_next_o,     // S[si] <- MEM[S[si]] self-advance
+  output logic                 arf_is_ldpcap_o,       // ldp+GPR copy + self-advance
+  output logic                 arf_is_pina_o,         // pin (mark directory entry PINNED)
+  output logic                 arf_is_unpin_o,
+  output logic                 arf_is_spalloc_o,
+  output logic                 arf_is_spfree_o,
+  output logic                 arf_is_sphint_o,
+  output logic                 arf_is_splr_o,
+  output logic                 arf_is_spflush_o,
+  output logic                 arf_is_wj_o,           // wait-jump family (CUSTOM-1/WJ)
+  output logic [6:0]           arf_wj_funct7_o,       // EQ/NE/SET selector for wj*
+  output logic [2:0]           arf_pred_o             // predicate register index for wj*
 );
 
   import ibex_pkg::*;
+  import ibex_bps_pkg::*;
 
   logic        illegal_insn;
   logic        illegal_reg_rv32e;
@@ -234,6 +254,26 @@ module ibex_decoder #(
     dret_insn_o           = 1'b0;
     ecall_insn_o          = 1'b0;
     wfi_insn_o            = 1'b0;
+
+    // BPS-V ARF control defaults (DESIGN.md §6). All inert unless a
+    // CUSTOM-0/1 arm sets them. arf_en_o gates the whole feature; the caller
+    // must additionally check the AddrRegFile core parameter (when it is 0,
+    // these instructions must be treated as illegal in ibex_core).
+    arf_en_o           = 1'b0;
+    arf_we_o           = 1'b0;
+    arf_deref_o        = 1'b0;
+    arf_is_ldp_next_o  = 1'b0;
+    arf_is_ldpcap_o    = 1'b0;
+    arf_is_pina_o      = 1'b0;
+    arf_is_unpin_o     = 1'b0;
+    arf_is_spalloc_o   = 1'b0;
+    arf_is_spfree_o    = 1'b0;
+    arf_is_sphint_o    = 1'b0;
+    arf_is_splr_o      = 1'b0;
+    arf_is_spflush_o   = 1'b0;
+    arf_is_wj_o        = 1'b0;
+    arf_wj_funct7_o    = 7'b0;
+    arf_pred_o         = 3'b0;
 
     opcode                = opcode_e'(instr[6:0]);
 
@@ -639,6 +679,102 @@ module ibex_decoder #(
           illegal_insn = csr_illegal;
         end
 
+      end
+      // ---------------------------------------------------------------
+      // BPS-V ARF datapath ops (DESIGN.md §6.2). Sub-op via instr[14:12],
+      // SLOTR/SLOTW distinguished by instr[30]. Slot index from rs1 or imm.
+      // NOTE: legality gating on the AddrRegFile core parameter is done in
+      // ibex_core (it ORs the feature-disabled illegal into this signal).
+      // ---------------------------------------------------------------
+      OPCODE_CUSTOM_0: begin
+        arf_en_o = 1'b1;
+        // Most ops read rs1 (the slot index) and rs2 (data); rd is a GPR dest.
+        rf_ren_a_o = 1'b1;
+        unique case (instr[14:12])
+          arf_custom0_f3_e'(ARF_F3_SLOTR): begin // slotr / slotw
+            if (instr[30] == 1'b0) begin           // SLOTR: rd <- S[rs1]
+              rf_we = 1'b1;                        // writes a GPR
+            end else begin                         // SLOTW: S[rs1] <- rs2
+              rf_ren_b_o = 1'b1;
+              arf_we_o   = 1'b1;
+            end
+          end
+          arf_custom0_f3_e'(ARF_F3_PINA): begin    // pina rs1, rs2
+            rf_ren_b_o = 1'b1;
+            arf_we_o   = 1'b1;
+            arf_is_pina_o = 1'b1;
+          end
+          arf_custom0_f3_e'(ARF_F3_UNPIN): begin   // unpin rs1
+            arf_is_unpin_o = 1'b1;
+          end
+          arf_custom0_f3_e'(ARF_F3_LDP): begin     // ldp rd, rs1
+            arf_deref_o = 1'b1;
+            rf_we = 1'b1;                          // rd <- MEM[S[rs1]]
+          end
+          arf_custom0_f3_e'(ARF_F3_STP): begin     // stp rs2, rs1
+            rf_ren_b_o = 1'b1;
+            arf_deref_o = 1'b1;
+            data_we_o  = 1'b1;                     // MEM[S[rs1]] <- rs2
+          end
+          arf_custom0_f3_e'(ARF_F3_LDPI): begin    // ldpi rd, imm12
+            arf_deref_o = 1'b1;
+            rf_we = 1'b1;                          // rd <- MEM[S[imm12]]
+          end
+          arf_custom0_f3_e'(ARF_F3_STPI): begin    // stpi rs2, imm12
+            rf_ren_b_o = 1'b1;
+            arf_deref_o = 1'b1;
+            data_we_o  = 1'b1;                     // MEM[S[imm12]] <- rs2
+          end
+          arf_custom0_f3_e'(ARF_F3_LDP_NEXT): begin // ldp.next si
+            arf_deref_o      = 1'b1;
+            arf_we_o         = 1'b1;               // S[si] <- MEM[S[si]]
+            arf_is_ldp_next_o = 1'b1;
+          end
+          default: illegal_insn = 1'b1;
+        endcase
+      end
+      // ---------------------------------------------------------------
+      // BPS-V ARF management / spill / wait-jump ops (DESIGN.md §6.2, §3.4).
+      // ---------------------------------------------------------------
+      OPCODE_CUSTOM_1: begin
+        arf_en_o = 1'b1;
+        unique case (instr[14:12])
+          arf_custom1_f3_e'(ARF_F3_SPHINT): begin  // sphint rd, rs1
+            rf_ren_a_o   = 1'b1;
+            arf_is_sphint_o = 1'b1;
+          end
+          arf_custom1_f3_e'(ARF_F3_SPLR): begin    // splr rd, rs1
+            rf_ren_a_o = 1'b1;
+            rf_we      = 1'b1;                     // rd <- metadata of S[rs1]
+            arf_is_splr_o = 1'b1;
+          end
+          arf_custom1_f3_e'(ARF_F3_SPFREE): begin  // spfree rs1
+            rf_ren_a_o = 1'b1;
+            arf_is_spfree_o = 1'b1;
+          end
+          arf_custom1_f3_e'(ARF_F3_SPALLOC): begin // spalloc rd
+            rf_we = 1'b1;                          // rd <- free slot index
+            arf_is_spalloc_o = 1'b1;
+          end
+          arf_custom1_f3_e'(ARF_F3_LDPCAP): begin  // ldpcap rd, rs1
+            rf_ren_a_o = 1'b1;
+            rf_we      = 1'b1;
+            arf_deref_o      = 1'b1;
+            arf_we_o         = 1'b1;
+            arf_is_ldpcap_o  = 1'b1;
+          end
+          arf_custom1_f3_e'(ARF_F3_SPFLUSH): begin // spflush
+            arf_is_spflush_o = 1'b1;
+          end
+          arf_custom1_f3_e'(ARF_F3_WJ): begin      // wj* pK, si, rs2, P
+            rf_ren_a_o = 1'b1;                      // rs1 = si index (or imm si)
+            rf_ren_b_o = 1'b1;                      // rs2 = sentinel value
+            arf_is_wj_o     = 1'b1;
+            arf_wj_funct7_o = instr[31:25];
+            arf_pred_o      = instr[11:9];          // predicate register index
+          end
+          default: illegal_insn = 1'b1;
+        endcase
       end
       default: begin
         illegal_insn = 1'b1;
@@ -1183,6 +1319,17 @@ module ibex_decoder #(
           end
         end
 
+      end
+      // BPS-V custom opcodes do not use the ALU datapath (they route through
+      // the ARF module and the LSU). Keep the inert defaults; ibex_core
+      // ignores alu_operator_o / operands when arf_en_o is set.
+      OPCODE_CUSTOM_0: begin
+        alu_op_a_mux_sel_o = OP_A_REG_A;
+        alu_op_b_mux_sel_o = OP_B_REG_B;
+      end
+      OPCODE_CUSTOM_1: begin
+        alu_op_a_mux_sel_o = OP_A_REG_A;
+        alu_op_b_mux_sel_o = OP_B_REG_B;
       end
       default: ;
     endcase

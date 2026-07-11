@@ -25,7 +25,9 @@ module ibex_id_stage #(
   parameter bit               BranchTargetALU = 0,
   parameter bit               WritebackStage  = 0,
   parameter bit               BranchPredictor = 0,
-  parameter bit               MemECC          = 1'b0
+  parameter bit               MemECC          = 1'b0,
+  // BPS-V: when 0, all CUSTOM-0/1 instructions are illegal.
+  parameter bit               AddrRegFile     = 1'b0
 ) (
   input  logic                      clk_i,
   input  logic                      rst_ni,
@@ -189,10 +191,29 @@ module ibex_id_stage #(
                                                         // access to finish before proceeding
   output logic                      perf_mul_wait_o,
   output logic                      perf_div_wait_o,
-  output logic                      instr_id_done_o
+  output logic                      instr_id_done_o,
+
+  // BPS-V ARF control pass-through (decoder -> core, core routes to ARF).
+  // DESIGN.md §6. All inert unless a CUSTOM-0/1 instruction is in flight.
+  output logic                      arf_en_o,
+  output logic                      arf_we_o,
+  output logic                      arf_deref_o,
+  output logic                      arf_is_ldp_next_o,
+  output logic                      arf_is_ldpcap_o,
+  output logic                      arf_is_pina_o,
+  output logic                      arf_is_unpin_o,
+  output logic                      arf_is_spalloc_o,
+  output logic                      arf_is_spfree_o,
+  output logic                      arf_is_sphint_o,
+  output logic                      arf_is_splr_o,
+  output logic                      arf_is_spflush_o,
+  output logic                      arf_is_wj_o,
+  output logic [6:0]                arf_wj_funct7_o,
+  output logic [2:0]                arf_pred_o
 );
 
   import ibex_pkg::*;
+  import ibex_bps_pkg::*;
 
   // Decoder/Controller, ID stage internal signals
   logic        illegal_insn_dec;
@@ -509,7 +530,24 @@ module ibex_id_stage #(
 
     // jump/branches
     .jump_in_dec_o  (jump_in_dec),
-    .branch_in_dec_o(branch_in_dec)
+    .branch_in_dec_o(branch_in_dec),
+
+    // BPS-V ARF control (DESIGN.md §6) — pass-through to core.
+    .arf_en_o           (arf_en_o),
+    .arf_we_o           (arf_we_o),
+    .arf_deref_o        (arf_deref_o),
+    .arf_is_ldp_next_o  (arf_is_ldp_next_o),
+    .arf_is_ldpcap_o    (arf_is_ldpcap_o),
+    .arf_is_pina_o      (arf_is_pina_o),
+    .arf_is_unpin_o     (arf_is_unpin_o),
+    .arf_is_spalloc_o   (arf_is_spalloc_o),
+    .arf_is_spfree_o    (arf_is_spfree_o),
+    .arf_is_sphint_o    (arf_is_sphint_o),
+    .arf_is_splr_o      (arf_is_splr_o),
+    .arf_is_spflush_o   (arf_is_spflush_o),
+    .arf_is_wj_o        (arf_is_wj_o),
+    .arf_wj_funct7_o    (arf_wj_funct7_o),
+    .arf_pred_o         (arf_pred_o)
   );
 
   // Flush pipe on most CSR modification. Some CSR modifications alter how instructions execute
@@ -539,7 +577,9 @@ module ibex_id_stage #(
                               (mret_insn_dec | (csr_mstatus_tw_i & wfi_insn_dec));
 
   assign illegal_insn_o = instr_valid_i &
-      (illegal_insn_dec | illegal_csr_insn_i | illegal_dret_insn | illegal_umode_insn);
+      (illegal_insn_dec | illegal_csr_insn_i | illegal_dret_insn | illegal_umode_insn |
+       // BPS-V: ARF instructions are illegal when the feature is disabled.
+       (arf_en_o & ~AddrRegFile));
 
   assign mem_resp_intg_err = lsu_load_resp_intg_err_i | lsu_store_resp_intg_err_i;
 
