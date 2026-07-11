@@ -24,7 +24,7 @@ package ibex_bps_pkg;
   // ARF geometry (DESIGN.md §4.1, §13). Sized for the PG2T390H instance.
   // -------------------------------------------------------------------------
   // Total ARF depth: 128K entries = 2^17 (fits 24% of the part's BRAM).
-  parameter int unsigned ARF_DEPTH      = 17'd131072;
+  parameter int unsigned ARF_DEPTH      = 32'd131072;
   // Number of banks: 64 = 2*W (W=32). Keeps the bank constraint satisfiable
   // by RA with headroom (DESIGN.md §4.4, DYNAREC.md §B.4).
   parameter int unsigned ARF_NUM_BANKS  = 64;
