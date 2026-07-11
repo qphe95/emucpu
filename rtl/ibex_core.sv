@@ -294,6 +294,26 @@ module ibex_core import ibex_pkg::*, ibex_bps_pkg::*; #(
   logic [6:0]  arf_wj_funct7;
   logic [2:0]  arf_pred;
 
+  // BPS-V VLIW dispatcher data-bus mux (DESIGN.md §7). When SuperscalarWidth
+  // > 1, the VLIW engine owns the data bus; otherwise the scalar LSU does.
+  logic        vliw_data_req;
+  logic [31:0] vliw_data_addr;
+  logic        vliw_data_we;
+  logic [3:0]  vliw_data_be;
+  logic [31:0] vliw_data_wdata;
+  logic        vliw_illegal_insn;
+  logic        vliw_busy;
+  // Scalar LSU data-bus outputs (now internal; muxed onto the core ports).
+  logic [31:0] lsu_data_addr;
+  logic        lsu_data_we;
+  logic [3:0]  lsu_data_be;
+  logic [31:0] lsu_data_wdata;
+
+  assign data_we_o     = (SuperscalarWidth > 32'd1) ? vliw_data_we     : lsu_data_we;
+  assign data_addr_o   = (SuperscalarWidth > 32'd1) ? vliw_data_addr   : lsu_data_addr;
+  assign data_be_o     = (SuperscalarWidth > 32'd1) ? vliw_data_be     : lsu_data_be;
+  assign data_wdata_o  = (SuperscalarWidth > 32'd1) ? vliw_data_wdata  : lsu_data_wdata;
+
   // ALU Control
   alu_op_e     alu_operator_ex;
   logic [31:0] alu_operand_a_ex;
@@ -897,11 +917,72 @@ module ibex_core import ibex_pkg::*, ibex_bps_pkg::*; #(
     assign clk_sram_2x = 1'b0;
   end
 
+  ///////////////////////////////////////////
+  // BPS-V: VLIW execution engine (§7)     //
+  ///////////////////////////////////////////
+  // When SuperscalarWidth > 1, the W-lane statically-dispatched engine
+  // replaces the scalar IF/ID/EX path and owns the data bus. When
+  // SuperscalarWidth == 1 (default), the scalar Ibex pipeline runs unchanged.
+  prim_ram_2p_pkg::ram_2p_cfg_req_t [SuperscalarWidth-1:0] bcache_cfg_req;
+  prim_ram_2p_pkg::ram_2p_cfg_rsp_t [SuperscalarWidth-1:0] bcache_cfg_rsp;
+  assign bcache_cfg_req = '{default: prim_ram_2p_pkg::RAM_2P_CFG_REQ_DEFAULT};
+
+  if (SuperscalarWidth > 32'd1) begin : gen_vliw
+    // Bundle-cache fill interface (quiescent; the dynarec/loader drives this
+    // through a CSR/mechanism wired in a follow-on).
+    logic vliw_fill_req;
+    logic [$clog2(SuperscalarWidth)-1:0] vliw_fill_bank;
+    logic [7:0] vliw_fill_addr; // 256-deep banks default
+    logic [31:0] vliw_fill_wdata;
+    assign vliw_fill_req   = 1'b0;
+    assign vliw_fill_bank  = '0;
+    assign vliw_fill_addr  = '0;
+    assign vliw_fill_wdata = '0;
+
+    ibex_vliw_dispatch #(
+      .SuperscalarWidth(SuperscalarWidth),
+      .DataWidth       (MemDataWidth),
+      .RV32B           (RV32B),
+      .RV32E           (RV32E)
+    ) vliw_i (
+      .clk_i          (clk_i),
+      .rst_ni         (rst_ni),
+      .clk_sram_2x_i  (clk_sram_2x),
+      .fetch_enable_i (fetch_enable_i[0]),
+      .busy_o         (vliw_busy),
+      .fill_req_i     (vliw_fill_req),
+      .fill_bank_i    (vliw_fill_bank),
+      .fill_addr_i    (vliw_fill_addr),
+      .fill_wdata_i   (vliw_fill_wdata),
+      .data_req_o     (vliw_data_req),
+      .data_addr_o    (vliw_data_addr),
+      .data_we_o      (vliw_data_we),
+      .data_be_o      (vliw_data_be),
+      .data_wdata_o   (vliw_data_wdata),
+      .data_gnt_i     (data_gnt_i),
+      .data_rvalid_i  (data_rvalid_i),
+      .data_rdata_i   (data_rdata_i),
+      .data_err_i     (data_err_i),
+      .illegal_insn_o (vliw_illegal_insn),
+      .bcache_cfg_i   (bcache_cfg_req),
+      .bcache_cfg_o   (bcache_cfg_rsp)
+    );
+  end else begin : gen_scalar
+    assign vliw_data_req   = 1'b0;
+    assign vliw_data_addr  = '0;
+    assign vliw_data_we    = 1'b0;
+    assign vliw_data_be    = 4'hF;
+    assign vliw_data_wdata = '0;
+    assign vliw_busy       = 1'b0;
+    assign vliw_illegal_insn = 1'b0;
+  end
+
   /////////////////////
   // Load/store unit //
   /////////////////////
 
-  assign data_req_o   = data_req_out & ~pmp_req_err[PMP_D];
+  assign data_req_o   = (SuperscalarWidth > 32'd1) ? vliw_data_req :
+                        (data_req_out & ~pmp_req_err[PMP_D]);
   assign lsu_resp_err = lsu_load_err | lsu_store_err;
 
   ibex_load_store_unit #(
@@ -918,10 +999,10 @@ module ibex_core import ibex_pkg::*, ibex_bps_pkg::*; #(
     .data_bus_err_i(data_err_i),
     .data_pmp_err_i(pmp_req_err[PMP_D]),
 
-    .data_addr_o      (data_addr_o),
-    .data_we_o        (data_we_o),
-    .data_be_o        (data_be_o),
-    .data_wdata_o     (data_wdata_o),
+    .data_addr_o      (lsu_data_addr),
+    .data_we_o        (lsu_data_we),
+    .data_be_o        (lsu_data_be),
+    .data_wdata_o     (lsu_data_wdata),
     .data_rdata_i     (data_rdata_i),
 
     // signals to/from ID/EX stage
