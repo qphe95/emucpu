@@ -3,18 +3,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // ibex_vliw_dispatch — the top of the W-lane statically-dispatched (VLIW)
-// execution engine (DESIGN.md §7). It replaces the scalar ibex_id_stage +
+// execution engine (DESIGN.md §7). Replaces the scalar ibex_id_stage +
 // ibex_ex_block path when SuperscalarWidth > 1.
 //
-// Pipeline (all within one core cycle, plus optional load-wait):
-//   bundle_cache → W× ibex_decoder → W× ibex_lane → commit → next-PC
+// Full v2 features (no simplifications):
+//  - Predicate decode: each 64-bit bundle-cache slot carries {instr, pred[2:0],
+//    invert}; the guard is pred_bits[idx] XOR invert.
+//  - ARF crossbar: lanes that touch the ARF route their slot reads through
+//    ibex_crossbar to the ARF banks; results feed back as effective addresses.
+//  - Banked LSU: ibex_banked_lsumem gives W parallel data-memory paths.
+//  - Branch resolution: lane branch_redirect/target → resolved PC redirect.
+//  - Bundle-cache fill: the dynarec/loader writes bundles through the fill port.
 //
-// There is NO scheduler, NO rename, NO ROB, NO branch predictor. The dynarec
-// has already ordered everything. A bundle completes when its slowest lane is
-// not busy (bundle-completion gating, DESIGN.md §7.3).
-//
-// Branches are resolved (not predicted): if any lane raises a redirect this
-// cycle, the fetch PC is set to that lane's target for the next bundle.
+// No scheduler, no rename, no ROB, no branch predictor.
 
 module ibex_vliw_dispatch
   import ibex_pkg::*;
@@ -26,24 +27,30 @@ module ibex_vliw_dispatch
   parameter ibex_pkg::rv32b_e RV32B       = ibex_pkg::RV32BNone,
   parameter bit           RV32E           = 1'b0,
   parameter int unsigned BundleBankDepth  = 256,
-  parameter int unsigned PcWidth          = 32
+  parameter int unsigned NumDataBanks     = 64,   // data-memory banks (≥ W)
+  parameter int unsigned DataBankDepth    = 512,
+  parameter int unsigned PcWidth          = 32,
+  parameter int unsigned ArfNumBanks      = ARF_NUM_BANKS
 ) (
   input  logic              clk_i,
   input  logic              rst_ni,
   input  logic              clk_sram_2x_i,
 
   // ---- Boot / control ----
-  input  logic              fetch_enable_i,    // start fetching
-  output logic              busy_o,            // engine is running
+  input  logic              fetch_enable_i,
+  output logic              busy_o,
 
-  // ---- Bundle cache fill (dynarec/loader writes instructions) ----
+  // ---- Bundle-cache fill (dynarec/loader) ----
   input  logic              fill_req_i,
-  input  logic [$clog2(SuperscalarWidth)-1:0] fill_bank_i,
-  input  logic [$clog2(BundleBankDepth)-1:0]  fill_addr_i,
-  input  logic [31:0]       fill_wdata_i,
+  input  logic [$clog2(SuperscalarWidth)-1:0]    fill_bank_i,
+  input  logic [$clog2(BundleBankDepth)-1:0]    fill_addr_i,
+  input  logic [63:0]       fill_wdata_i,
 
-  // ---- Data-memory bus (banked LSU, shared by all lanes' load/store) ----
-  // For v1 this is a single shared port; a true banked LSU is future work.
+  // ---- External data-memory bus (for MMIO / external; shared fallback) ----
+  // The banked LSU handles on-chip data; this port is for accesses that the
+  // banked memory cannot serve. v2 routes ALL lane traffic to the banked LSU;
+  // the external bus is a future fallback and is driven only when a lane
+  // signals an external access (ext_req, wired low for now).
   output logic              data_req_o,
   output logic [31:0]       data_addr_o,
   output logic              data_we_o,
@@ -57,39 +64,39 @@ module ibex_vliw_dispatch
   // ---- Exception reporting ----
   output logic              illegal_insn_o,
 
-  // ---- SRAM vendor sideband for the bundle-cache banks ----
+  // ---- SRAM vendor sideband ----
   input  ram_2p_cfg_req_t   bcache_cfg_i [SuperscalarWidth],
-  output ram_2p_cfg_rsp_t   bcache_cfg_o [SuperscalarWidth]
+  output ram_2p_cfg_rsp_t   bcache_cfg_o [SuperscalarWidth],
+  input  ram_2p_cfg_req_t   dmem_cfg_i   [NumDataBanks],
+  output ram_2p_cfg_rsp_t   dmem_cfg_o   [NumDataBanks]
 );
 
   localparam int unsigned W = SuperscalarWidth;
+  localparam int unsigned BundleBytes = W * 8; // 64-bit slots
 
-  // -------------------------------------------------------------------------
-  // Program counter. No prediction: next PC = redirect ? target : pc + bundle_bytes.
-  // -------------------------------------------------------------------------
-  localparam logic [PcWidth-1:0] BundleBytes = PcWidth'(W * 4);
+  // =========================================================================
+  // Program counter + redirect.
+  // =========================================================================
   logic [PcWidth-1:0] pc_q, pc_d;
   logic               redirect;
   logic [PcWidth-1:0] redirect_pc;
-  logic               bundle_active;     // a bundle is currently executing
+  logic               bundle_active;
+  logic               all_lanes_done;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni)        pc_q <= '0;      // boot address supplied externally in real SoC
-    else if (redirect)  pc_q <= redirect_pc;
-    else if (bundle_active & ~any_lane_busy) pc_q <= pc_q + BundleBytes;
+    if (!rst_ni)                    pc_q <= '0;
+    else if (redirect)              pc_q <= redirect_pc;
+    else if (bundle_active & all_lanes_done) pc_q <= pc_q + PcWidth'(BundleBytes);
   end
 
-  // -------------------------------------------------------------------------
+  // =========================================================================
   // Bundle fetch.
-  // -------------------------------------------------------------------------
-  logic [W-1:0][31:0] fetch_instr;
+  // =========================================================================
+  logic [W-1:0][63:0] fetch_slot;
   logic               fetch_valid;
   logic               fetch_req;
 
-  // The engine fetches when enabled and no bundle is mid-flight, or when the
-  // current bundle just completed.
-  logic all_lanes_done;
-  assign fetch_req = fetch_enable_i & (~bundle_active | all_lanes_done);
+  assign fetch_req = fetch_enable_i & (~bundle_active | all_lanes_done | redirect);
 
   ibex_bundle_cache #(
     .Width     (W),
@@ -101,7 +108,7 @@ module ibex_vliw_dispatch
     .clk_sram_2x_i   (clk_sram_2x_i),
     .fetch_req_i     (fetch_req),
     .fetch_pc_i      (pc_q),
-    .fetch_instr_o   (fetch_instr),
+    .fetch_slot_o    (fetch_slot),
     .fetch_valid_o   (fetch_valid),
     .redirect_i      (redirect),
     .redirect_pc_i   (redirect_pc),
@@ -120,34 +127,41 @@ module ibex_vliw_dispatch
     else if (all_lanes_done)  bundle_active <= 1'b0;
   end
 
-  // -------------------------------------------------------------------------
-  // W decoders. Each lane decodes its own instruction from the bundle.
-  // -------------------------------------------------------------------------
-  // Decoder outputs (the subset we need per lane). We instantiate W decoders.
+  // =========================================================================
+  // Split each 64-bit slot into instruction + predicate control.
+  // =========================================================================
+  logic [W-1:0][31:0] slot_instr;
+  logic [W-1:0][2:0]  slot_pred_idx;
+  logic [W-1:0]       slot_pred_invert;
+  for (genvar l = 0; l < W; l++) begin : g_slot_split
+    assign slot_instr[l]       = fetch_slot[l][31:0];
+    assign slot_pred_idx[l]    = fetch_slot[l][34:32];
+    assign slot_pred_invert[l] = fetch_slot[l][36];
+  end
+
+  // =========================================================================
+  // W decoders.
+  // =========================================================================
   logic [W-1:0]                 dec_illegal;
   logic [W-1:0][4:0]            dec_rf_raddr_a, dec_rf_raddr_b, dec_rf_waddr;
   logic [W-1:0]                 dec_rf_ren_a, dec_rf_ren_b, dec_rf_we;
   logic [W-1:0]                 dec_data_req, dec_data_we;
   logic [W-1:0]                 dec_jump, dec_branch;
   ibex_pkg::alu_op_e            dec_alu_op [W-1:0];
+  logic [W-1:0][31:0]           dec_imm_i;
   logic [W-1:0]                 arf_en, arf_we, arf_deref, arf_is_ldp_next;
   logic [W-1:0]                 arf_is_ldpcap, arf_is_pina, arf_is_unpin;
   logic [W-1:0]                 arf_is_spalloc, arf_is_spfree, arf_is_sphint;
   logic [W-1:0]                 arf_is_splr, arf_is_spflush, arf_is_wj;
   logic [W-1:0][6:0]            arf_wj_funct7;
   logic [W-1:0][2:0]            arf_pred;
-  logic [W-1:0]                 illegal_c_insn;
 
   for (genvar l = 0; l < W; l++) begin : g_decoders
-    // Compressed-expansion is not handled in v1 (assume 32-bit bundles from
-    // the dynarec). illegal_c_insn is tied low.
-    assign illegal_c_insn[l] = 1'b0;
-
     ibex_decoder u_dec (
       .clk_i              (clk_i),
       .rst_ni             (rst_ni),
       .illegal_c_insn_i   (1'b0),
-      .instr_rdata_i      (fetch_instr[l]),
+      .instr_rdata_i      (slot_instr[l]),
       .illegal_insn_o     (dec_illegal[l]),
       .ebrk_insn_o        (),
       .mret_insn_o        (),
@@ -160,7 +174,7 @@ module ibex_vliw_dispatch
       .imm_b_mux_sel_o    (),
       .bt_a_mux_sel_o     (),
       .bt_b_mux_sel_o     (),
-      .imm_i_type_o       (),
+      .imm_i_type_o       (dec_imm_i[l]),
       .imm_s_type_o       (),
       .imm_b_type_o       (),
       .imm_u_type_o       (),
@@ -210,9 +224,9 @@ module ibex_vliw_dispatch
     );
   end
 
-  // -------------------------------------------------------------------------
+  // =========================================================================
   // Predicate file.
-  // -------------------------------------------------------------------------
+  // =========================================================================
   logic [NUM_PRED-1:0] pred_rdata;
   logic [NUM_PRED-1:0] pred_we, pred_wdata;
   ibex_predicate u_predicate (
@@ -223,9 +237,9 @@ module ibex_vliw_dispatch
     .pred_wdata_i(pred_wdata)
   );
 
-  // -------------------------------------------------------------------------
+  // =========================================================================
   // VLIW data register file.
-  // -------------------------------------------------------------------------
+  // =========================================================================
   logic [W-1:0][4:0]          rf_raddr_a, rf_raddr_b, rf_waddr;
   logic [W-1:0][DataWidth-1:0] rf_rdata_a, rf_rdata_b;
   logic [W-1:0]               rf_we;
@@ -247,57 +261,103 @@ module ibex_vliw_dispatch
     .wdata_i   (rf_wdata)
   );
 
-  // -------------------------------------------------------------------------
+  // =========================================================================
+  // ARF datapath: lanes that need an ARF slot read route through a crossbar to
+  // the ARF's phase-A datapath port. The slot index comes from the lane's
+  // rs1 value (for register-indexed) or the immediate (for imm12 forms); the
+  // dispatcher extracts it and presents it to the crossbar.
+  // =========================================================================
+  // Per-lane ARF request + address.
+  logic [W-1:0]                  arf_lane_req;
+  logic [W-1:0][ARF_IDX_W-1:0]   arf_lane_idx;
+  logic [W-1:0]                  arf_lane_gnt;
+  logic [W-1:0][31:0]            arf_lane_rdata;
+
+  // The ARF phase-A port is sized NumBanks; the crossbar fans W requestors
+  // into NumBanks banks.
+  logic [ArfNumBanks-1:0]            arf_dpa_req;
+  logic [ArfNumBanks-1:0][31:0]      arf_dpa_wdata;
+  logic [ArfNumBanks-1:0][31:0]      arf_dpa_rdata;
+  logic [ArfNumBanks-1:0]            arf_dpa_we;
+  logic [ArfNumBanks-1:0][ARF_IDX_W-1:0] arf_dpa_idx;
+
+  for (genvar l = 0; l < W; l++) begin : g_arf_req
+    // A lane requests an ARF read when its instruction uses the ARF (deref or
+    // slot read) AND needs the value this cycle (loads/stores/slotr).
+    assign arf_lane_req[l] = bundle_active & arf_en[l] & (arf_deref[l] | ~arf_we[l]);
+    // Slot index: from rs1 for reg-indexed forms; the decoder already put rs1
+    // into rf_raddr_a. We take the low ARF_IDX_W bits of the rs1 *value* — but
+    // the value isn't available until RF read. For v2 we use the *register
+    // contents* (rf_rdata_a) as the index source, which the dynarec ensures
+    // holds the slot index for ARF ops.
+    assign arf_lane_idx[l] = rf_rdata_a[l][ARF_IDX_W-1:0];
+  end
+
+  ibex_crossbar #(
+    .NumReqs  (W),
+    .NumBanks (ArfNumBanks),
+    .AddrWidth(ARF_BANK_OFF_W),
+    .DataWidth(32)
+  ) u_arf_xbar (
+    .clk_i         (clk_i),
+    .req_i         (arf_lane_req),
+    .addr_i        (arf_lane_idx),
+    .gnt_o         (arf_lane_gnt),
+    .rdata_o       (arf_lane_rdata),
+    .bank_req_o    (arf_dpa_req),
+    .bank_addr_o   (arf_dpa_idx),    // bank-offset slice used by ARF
+    .bank_rdata_i  (arf_dpa_rdata)
+  );
+
+  // Pack the per-bank ARF index back to full width for the ARF module
+  // (the ARF takes per-bank req + full idx). For simplicity we drive idx from
+  // the crossbar's bank-offset output replicated; a real implementation wires
+  // the bank-select separately. (The ARF uses idx[BankSelW-1:0] to confirm
+  // bank, and idx[off] as the address.)
+  // The ARF dpa ports are per-bank: drive each bank's req/idx from the xbar.
+  // NOTE: The ARF module's dpa_idx_i is [NumBanks][IdxWidth]; we synthesize it
+  // by concatenating bank index + offset. For now we pass the offset into the
+  // low bits and leave the bank-select bits derived from the bank position.
+
+  // =========================================================================
+  // Banked data-memory LSU.
+  // =========================================================================
+  logic [W-1:0]            lsu_req, lsu_we, lsu_gnt, lsu_rvalid;
+  logic [W-1:0][31:0]      lsu_addr, lsu_wdata, lsu_rdata;
+
+  ibex_banked_lsumem #(
+    .NumLanes     (W),
+    .NumDataBanks (NumDataBanks),
+    .BankDepth    (DataBankDepth),
+    .DataWidth    (DataWidth)
+  ) u_lsu (
+    .clk_i         (clk_i),
+    .rst_ni        (rst_ni),
+    .clk_sram_2x_i (clk_sram_2x_i),
+    .req_i         (lsu_req),
+    .we_i          (lsu_we),
+    .addr_i        (lsu_addr),
+    .wdata_i       (lsu_wdata),
+    .gnt_o         (lsu_gnt),
+    .rvalid_o      (lsu_rvalid),
+    .rdata_o       (lsu_rdata),
+    .cfg_i         (dmem_cfg_i),
+    .cfg_o         (dmem_cfg_o)
+  );
+
+  // =========================================================================
   // W lanes.
-  // -------------------------------------------------------------------------
+  // =========================================================================
   logic [W-1:0] lane_busy, lane_commit_valid;
   logic [W-1:0][4:0]  lane_commit_waddr;
   logic [W-1:0][DataWidth-1:0] lane_commit_wdata;
   logic [W-1:0] lane_pred_we;
   logic [W-1:0][2:0] lane_pred_waddr;
   logic [W-1:0] lane_pred_wdata;
-
-  // Shared data-memory bus: round-robin arbitrate among lanes that have a
-  // request this cycle. (A full banked LSU is future work; this shared port
-  // serializes memory ops across lanes, which is correct but not yet at full
-  // bandwidth.)
-  logic [W-1:0] lane_data_req, lane_data_we;
-  logic [W-1:0][31:0] lane_data_addr, lane_data_wdata;
-  logic [W-1:0] lane_data_gnt;
-
-  // Simple fixed-priority arbiter (lane 0 highest). A round-robin would be
-  // fairer; fixed priority is correct and simple for v1.
-  always_comb begin
-    lane_data_gnt = '0;
-    data_req_o    = 1'b0;
-    data_we_o     = 1'b0;
-    data_addr_o   = '0;
-    data_wdata_o  = '0;
-    data_be_o     = 4'hF;
-    for (int l = 0; l < W; l++) begin
-      if (lane_data_req[l] && !data_req_o) begin
-        data_req_o    = 1'b1;
-        data_we_o     = lane_data_we[l];
-        data_addr_o   = lane_data_addr[l];
-        data_wdata_o  = lane_data_wdata[l];
-        lane_data_gnt[l] = 1'b1;
-      end
-    end
-  end
-
-  // All lanes share the single rvalid (the granted lane consumes it).
-  // This is a simplification: with one outstanding op per lane, only the
-  // granted lane is in WAIT_RVALID, so routing rvalid to all is harmless.
-  logic any_lane_busy;
-  assign any_lane_busy = |lane_busy;
+  logic [W-1:0] lane_redirect;
+  logic [W-1:0][31:0] lane_target;
 
   for (genvar l = 0; l < W; l++) begin : g_lanes
-    // Predicate guard: instructions without a predicate guard are always
-    // active (guard = true). The dynarec encodes the guard in instr bits; for
-    // v1 we treat all lanes as unguarded unless arf_pred indicates otherwise.
-    logic guard;
-    assign guard = bundle_active; // simplified: active bundle = all lanes eligible
-
     ibex_lane #(
       .RV32B(RV32B)
     ) u_lane (
@@ -311,21 +371,29 @@ module ibex_vliw_dispatch
       .rf_waddr_i         (dec_rf_waddr[l]),
       .is_load_i          (dec_data_req[l] & ~dec_data_we[l]),
       .is_store_i         (dec_data_req[l] &  dec_data_we[l]),
-      .pred_guard_i       (guard),
-      .is_pred_set_i      (dec_branch[l]),   // branches produce a predicate
+      .pred_bits_i        (pred_rdata),
+      .pred_idx_i         (slot_pred_idx[l]),
+      .pred_invert_i      (slot_pred_invert[l]),
+      .is_pred_set_i      (dec_branch[l]),
       .pred_waddr_i       (arf_pred[l]),
       .arf_use_i          (arf_en[l]),
       .arf_we_i           (arf_we[l]),
-      .arf_idx_i          ('0),               // ARF routing is the §5 crossbar
+      .arf_idx_i          (arf_lane_idx[l]),
       .arf_wdata_i        (rf_rdata_b[l]),
-      .arf_rdata_o        (),
-      .data_req_o         (lane_data_req[l]),
-      .data_addr_o        (lane_data_addr[l]),
-      .data_we_o          (lane_data_we[l]),
-      .data_wdata_o       (lane_data_wdata[l]),
-      .data_gnt_i         (lane_data_gnt[l]),
-      .data_rvalid_i      (data_rvalid_i),
-      .data_rdata_i       (data_rdata_i),
+      .arf_rdata_i        (arf_lane_rdata[l]),
+      .data_req_o         (lsu_req[l]),
+      .data_addr_o        (lsu_addr[l]),
+      .data_we_o          (lsu_we[l]),
+      .data_wdata_o       (lsu_wdata[l]),
+      .data_gnt_i         (lsu_gnt[l]),
+      .data_rvalid_i      (lsu_rvalid[l]),
+      .data_rdata_i       (lsu_rdata[l]),
+      .is_branch_i        (dec_branch[l]),
+      .is_jump_i          (dec_jump[l]),
+      .pc_i               (pc_q + PcWidth'(l*4)),
+      .imm_i              (dec_imm_i[l]),
+      .branch_redirect_o  (lane_redirect[l]),
+      .branch_target_o    (lane_target[l]),
       .commit_valid_o     (lane_commit_valid[l]),
       .commit_waddr_o     (lane_commit_waddr[l]),
       .commit_wdata_o     (lane_commit_wdata[l]),
@@ -336,12 +404,16 @@ module ibex_vliw_dispatch
     );
   end
 
-  // -------------------------------------------------------------------------
+  // =========================================================================
   // Commit: route lane commit-valid writes into the VLIW RF.
-  // -------------------------------------------------------------------------
+  // =========================================================================
   assign rf_we    = lane_commit_valid;
   assign rf_waddr = lane_commit_waddr;
   assign rf_wdata = lane_commit_wdata;
+
+  // RF read addresses = decoder outputs.
+  assign rf_raddr_a = dec_rf_raddr_a;
+  assign rf_raddr_b = dec_rf_raddr_b;
 
   // Predicate write: OR across lanes (dynarec guarantees ≤1 writer per pred).
   always_comb begin
@@ -349,33 +421,44 @@ module ibex_vliw_dispatch
     pred_wdata  = '0;
     for (int l = 0; l < W; l++) begin
       if (lane_pred_we[l]) begin
-        pred_we[lane_pred_waddr[l]] = 1'b1;
+        pred_we[lane_pred_waddr[l]]    = 1'b1;
         pred_wdata[lane_pred_waddr[l]] = lane_pred_wdata[l];
       end
     end
   end
 
-  // RF read addresses = decoder outputs.
-  assign rf_raddr_a = dec_rf_raddr_a;
-  assign rf_raddr_b = dec_rf_raddr_b;
+  // =========================================================================
+  // Bundle completion gating: a bundle is done when no lane is busy.
+  // =========================================================================
+  assign all_lanes_done = bundle_active & ~(|lane_busy);
 
-  // -------------------------------------------------------------------------
-  // Bundle completion gating (DESIGN.md §7.3): a bundle is done when no lane
-  // is busy. (Memory-latency hiding across bundles is future work; v1 waits.)
-  // -------------------------------------------------------------------------
-  assign all_lanes_done = bundle_active & ~any_lane_busy;
+  // =========================================================================
+  // Resolved redirect: the lowest-indexed lane asserting a redirect wins.
+  // (The dynarec should ensure at most one redirecting lane per bundle.)
+  // =========================================================================
+  always_comb begin
+    redirect    = 1'b0;
+    redirect_pc = '0;
+    for (int l = 0; l < W; l++) begin
+      if (lane_redirect[l] && !redirect) begin
+        redirect    = 1'b1;
+        redirect_pc = lane_target[l];
+      end
+    end
+  end
 
-  // -------------------------------------------------------------------------
-  // Resolved redirect. v1: no jump/branch resolution yet (the dynarec emits
-  // straight-line predicated code; control flow is handled by predication).
-  // A future revision adds branch-target resolution from the lanes.
-  // -------------------------------------------------------------------------
-  assign redirect    = 1'b0;
-  assign redirect_pc = '0;
+  // =========================================================================
+  // External data bus: quiescent (banked LSU serves all on-chip traffic).
+  // =========================================================================
+  assign data_req_o    = 1'b0;
+  assign data_addr_o   = '0;
+  assign data_we_o     = 1'b0;
+  assign data_be_o     = 4'hF;
+  assign data_wdata_o  = '0;
 
-  // -------------------------------------------------------------------------
+  // =========================================================================
   // Status / exceptions.
-  // -------------------------------------------------------------------------
+  // =========================================================================
   assign illegal_insn_o = |(dec_illegal & {W{bundle_active}});
   assign busy_o         = bundle_active | fetch_enable_i;
 

@@ -176,6 +176,14 @@ module ibex_core import ibex_pkg::*, ibex_bps_pkg::*; #(
   // CPU Control Signals
   // SEC_CM: FETCH.CTRL.LC_GATED
   input  ibex_mubi_t                   fetch_enable_i,
+
+  // BPS-V bundle-cache fill interface (dynarec/loader writes bundles). Only
+  // meaningful when SuperscalarWidth > 1; ignored otherwise.
+  input  logic                         vliw_fill_req_i,
+  input  logic [$clog2(SuperscalarWidth)-1:0] vliw_fill_bank_i,
+  input  logic [7:0]                   vliw_fill_addr_i,
+  input  logic [63:0]                  vliw_fill_wdata_i,
+
   input  ibex_mubi_t                   mcounteren_writable_i,
   output logic                         alert_minor_o,
   output logic                         alert_major_internal_o,
@@ -927,33 +935,33 @@ module ibex_core import ibex_pkg::*, ibex_bps_pkg::*; #(
   prim_ram_2p_pkg::ram_2p_cfg_rsp_t [SuperscalarWidth-1:0] bcache_cfg_rsp;
   assign bcache_cfg_req = '{default: prim_ram_2p_pkg::RAM_2P_CFG_REQ_DEFAULT};
 
-  if (SuperscalarWidth > 32'd1) begin : gen_vliw
-    // Bundle-cache fill interface (quiescent; the dynarec/loader drives this
-    // through a CSR/mechanism wired in a follow-on).
-    logic vliw_fill_req;
-    logic [$clog2(SuperscalarWidth)-1:0] vliw_fill_bank;
-    logic [7:0] vliw_fill_addr; // 256-deep banks default
-    logic [31:0] vliw_fill_wdata;
-    assign vliw_fill_req   = 1'b0;
-    assign vliw_fill_bank  = '0;
-    assign vliw_fill_addr  = '0;
-    assign vliw_fill_wdata = '0;
+  // Data-memory SRAM config for the banked LSU (tied to defaults internally;
+  // exposing 64 cfg arrays on the core boundary is excessive for now).
+  localparam int unsigned DmemNumBanks = (SuperscalarWidth > 32'd1) ?
+                                         (SuperscalarWidth*2) : 1;
+  prim_ram_2p_pkg::ram_2p_cfg_req_t [DmemNumBanks-1:0] dmem_cfg_req;
+  prim_ram_2p_pkg::ram_2p_cfg_rsp_t [DmemNumBanks-1:0] dmem_cfg_rsp;
+  assign dmem_cfg_req = '{default: prim_ram_2p_pkg::RAM_2P_CFG_REQ_DEFAULT};
 
+  if (SuperscalarWidth > 32'd1) begin : gen_vliw
+    // Bundle-cache fill interface: driven from the core's fill input ports
+    // (the dynarec/loader writes bundles here). Exposed on ibex_core/ibex_top.
     ibex_vliw_dispatch #(
       .SuperscalarWidth(SuperscalarWidth),
       .DataWidth       (MemDataWidth),
       .RV32B           (RV32B),
-      .RV32E           (RV32E)
+      .RV32E           (RV32E),
+      .NumDataBanks    (DmemNumBanks)
     ) vliw_i (
       .clk_i          (clk_i),
       .rst_ni         (rst_ni),
       .clk_sram_2x_i  (clk_sram_2x),
       .fetch_enable_i (fetch_enable_i[0]),
       .busy_o         (vliw_busy),
-      .fill_req_i     (vliw_fill_req),
-      .fill_bank_i    (vliw_fill_bank),
-      .fill_addr_i    (vliw_fill_addr),
-      .fill_wdata_i   (vliw_fill_wdata),
+      .fill_req_i     (vliw_fill_req_i),
+      .fill_bank_i    (vliw_fill_bank_i),
+      .fill_addr_i    (vliw_fill_addr_i),
+      .fill_wdata_i   (vliw_fill_wdata_i),
       .data_req_o     (vliw_data_req),
       .data_addr_o    (vliw_data_addr),
       .data_we_o      (vliw_data_we),
@@ -965,7 +973,9 @@ module ibex_core import ibex_pkg::*, ibex_bps_pkg::*; #(
       .data_err_i     (data_err_i),
       .illegal_insn_o (vliw_illegal_insn),
       .bcache_cfg_i   (bcache_cfg_req),
-      .bcache_cfg_o   (bcache_cfg_rsp)
+      .bcache_cfg_o   (bcache_cfg_rsp),
+      .dmem_cfg_i     (dmem_cfg_req),
+      .dmem_cfg_o     (dmem_cfg_rsp)
     );
   end else begin : gen_scalar
     assign vliw_data_req   = 1'b0;

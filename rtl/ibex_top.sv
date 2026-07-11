@@ -163,6 +163,11 @@ module ibex_top import ibex_pkg::*; #(
 
   // CPU Control Signals
   input  ibex_mubi_t                                                  fetch_enable_i,
+  // BPS-V bundle-cache fill (dynarec/loader).
+  input  logic                                                        vliw_fill_req_i,
+  input  logic [$clog2(SuperscalarWidth)-1:0]                         vliw_fill_bank_i,
+  input  logic [7:0]                                                  vliw_fill_addr_i,
+  input  logic [63:0]                                                 vliw_fill_wdata_i,
   input  ibex_mubi_t                                                  mcounteren_writable_i,
   output logic                                                        alert_minor_o,
   output logic                                                        alert_major_internal_o,
@@ -461,6 +466,10 @@ module ibex_top import ibex_pkg::*; #(
 `endif
 
     .fetch_enable_i        (fetch_enable_buf),
+    .vliw_fill_req_i       (vliw_fill_req_i),
+    .vliw_fill_bank_i      (vliw_fill_bank_i),
+    .vliw_fill_addr_i      (vliw_fill_addr_i),
+    .vliw_fill_wdata_i     (vliw_fill_wdata_i),
     .mcounteren_writable_i (mcounteren_writable_buf),
     .alert_minor_o         (core_alert_minor),
     .alert_major_internal_o(core_alert_major_internal),
@@ -1102,6 +1111,10 @@ module ibex_top import ibex_pkg::*; #(
       .double_fault_seen_i      (double_fault_seen_local),
 
       .fetch_enable_i           (fetch_enable_local),
+      .vliw_fill_req_i          (vliw_fill_req_i),
+      .vliw_fill_bank_i         (vliw_fill_bank_i),
+      .vliw_fill_addr_i         (vliw_fill_addr_i),
+      .vliw_fill_wdata_i        (vliw_fill_wdata_i),
       .mcounteren_writable_i    (mcounteren_writable_local),
       .alert_minor_o            (lockstep_alert_minor_local),
       .alert_major_internal_o   (lockstep_alert_major_internal_local),

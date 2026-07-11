@@ -107,6 +107,11 @@ module ibex_lockstep import ibex_pkg::*; #(
   input  logic                         double_fault_seen_i,
 
   input  ibex_mubi_t                   fetch_enable_i,
+  // BPS-V bundle-cache fill.
+  input  logic                         vliw_fill_req_i,
+  input  logic [$clog2(SuperscalarWidth)-1:0] vliw_fill_bank_i,
+  input  logic [7:0]                   vliw_fill_addr_i,
+  input  logic [63:0]                  vliw_fill_wdata_i,
   input  ibex_mubi_t                   mcounteren_writable_i,
   output logic                         alert_minor_o,
   output logic                         alert_major_internal_o,
@@ -562,6 +567,10 @@ module ibex_lockstep import ibex_pkg::*; #(
 `endif
 
     .fetch_enable_i         (shadow_inputs_q[0].fetch_enable),
+    .vliw_fill_req_i        (vliw_fill_req_i),
+    .vliw_fill_bank_i       (vliw_fill_bank_i),
+    .vliw_fill_addr_i       (vliw_fill_addr_i),
+    .vliw_fill_wdata_i      (vliw_fill_wdata_i),
     .mcounteren_writable_i  (shadow_inputs_q[0].mcounteren_writable),
     .alert_minor_o          (shadow_alert_minor),
     .alert_major_internal_o (shadow_alert_major_internal),

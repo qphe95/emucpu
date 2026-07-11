@@ -8,19 +8,14 @@
 // is false commits nothing.
 //
 // The lane reuses ibex_alu for the arithmetic. The lane does NOT schedule —
-// the dynarec has already ordered everything. For multi-cycle ops (loads,
-// which have exposed Lmem latency) the lane asserts busy until the response
-// returns; the dispatcher holds the bundle until all lanes are not busy.
+// the dynarec has already ordered everything.
 //
-// The lane has:
-//  - one ALU (rv32 arithmetic; the decoder selected alu_operator)
-//  - a predicate guard (from ibex_predicate, broadcast to all lanes)
-//  - an ARF read/write port (for ldp/stp/slotr/slotw/pina/ldp.next)
-//  - a single data-memory request port (loads/stores share the banked LSU)
-//
-// The LSU handshake here is deliberately simple: one outstanding load or
-// store per lane. The dispatcher's bundle-completion gating (DESIGN.md §7.3)
-// handles the wait.
+// Full v2 features:
+//  - Predicate guard evaluated from the broadcast predicate file bits.
+//  - ARF slot value supplied by the dispatcher's ARF crossbar (arf_rdata_i).
+//  - Branch decision (from ALU comparison) + target (PC + imm, or rs1+imm)
+//    reported back to the dispatcher for resolved-redirect.
+//  - Effective address = ARF slot value for deref ops, ALU adder for lw/sw.
 
 module ibex_lane
   import ibex_pkg::*;
@@ -42,18 +37,20 @@ module ibex_lane
   input  logic              is_store_i,     // ... store
 
   // ---- Predicate guard ----
-  input  logic              pred_guard_i,   // 1 = lane active, 0 = commit nothing
-  input  logic              is_pred_set_i,  // this lane writes a predicate (cmp)
-  input  logic [2:0]        pred_waddr_i,   // which predicate to write
+  input  logic [NUM_PRED-1:0] pred_bits_i,    // the broadcast predicate file
+  input  logic [2:0]          pred_idx_i,     // this instr's predicate index
+  input  logic                pred_invert_i,  // invert the guard
+  input  logic                is_pred_set_i,  // this lane writes a predicate (cmp)
+  input  logic [2:0]          pred_waddr_i,   // which predicate to write
 
   // ---- ARF port (phase A datapath) ----
   input  logic              arf_use_i,      // this lane touches the ARF this cycle
   input  logic              arf_we_i,       // ARF write (slotw/pina/ldp.next)
   input  logic [ARF_IDX_W-1:0] arf_idx_i,   // slot index
   input  logic [31:0]       arf_wdata_i,    // data to write to the slot
-  output logic [31:0]       arf_rdata_o,    // value read from the slot (for deref)
+  input  logic [31:0]       arf_rdata_i,    // value read from the slot (from xbar)
 
-  // ---- Data-memory request (shared banked LSU) ----
+  // ---- Data-memory request (banked LSU) ----
   output logic              data_req_o,
   output logic [31:0]       data_addr_o,
   output logic              data_we_o,
@@ -62,11 +59,19 @@ module ibex_lane
   input  logic              data_rvalid_i,
   input  logic [31:0]       data_rdata_i,
 
+  // ---- Branch / jump resolution (resolved, non-speculative) ----
+  input  logic              is_branch_i,    // this instr is a conditional branch
+  input  logic              is_jump_i,      // this instr is JAL/JALR
+  input  logic [31:0]       pc_i,           // this instr's PC (for target)
+  input  logic [31:0]       imm_i,          // branch/jump immediate
+  output logic              branch_redirect_o,   // this lane wants a redirect
+  output logic [31:0]       branch_target_o,     // the resolved target
+
   // ---- Results to commit ----
-  output logic              commit_valid_o, // this lane has a valid GPR write
+  output logic              commit_valid_o,
   output logic [4:0]        commit_waddr_o,
   output logic [31:0]       commit_wdata_o,
-  output logic              pred_we_o,      // predicate write from this lane
+  output logic              pred_we_o,
   output logic [2:0]        pred_waddr_commit_o,
   output logic              pred_wdata_commit_o,
 
@@ -75,9 +80,14 @@ module ibex_lane
 );
 
   // -------------------------------------------------------------------------
-  // ALU (rv32 arithmetic). We reuse ibex_alu; multdiv not supported per lane
-  // in this revision (mul/div go through a shared unit if needed — the
-  // dynarec places them on a dedicated lane in a future phase).
+  // Predicate guard.
+  // -------------------------------------------------------------------------
+  logic guard_raw, guard;
+  assign guard_raw = pred_bits_i[pred_idx_i];
+  assign guard     = pred_invert_i ? ~guard_raw : guard_raw;
+
+  // -------------------------------------------------------------------------
+  // ALU.
   // -------------------------------------------------------------------------
   logic [31:0] alu_result;
   logic [31:0] alu_adder_result;
@@ -87,8 +97,6 @@ module ibex_lane
   logic        alu_cmp_result;
   logic        alu_is_equal;
 
-  // imd_val registers live in the lane (the ALU's intermediate values for
-  // multicycle shift/extract). For single-cycle ALU ops these are unused.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       imd_val_q[0] <= '0;
@@ -120,18 +128,16 @@ module ibex_lane
   );
 
   // -------------------------------------------------------------------------
-  // ARF read (combinational from the lane's ARF port — the dispatcher wires
-  // arf_idx_i to the ARF bank selected for this lane).
+  // Effective address: ARF slot value for deref ops, ALU adder for native
+  // lw/sw. (Both the dispatcher and the lane need to agree; the dispatcher
+  // sets is_load_i/is_store_i and arf_use_i from the decode.)
   // -------------------------------------------------------------------------
-  // arf_rdata_o is the value stored in the slot; used as the effective
-  // address for deref ops (ldp/stp).
-  assign arf_rdata_o = arf_wdata_i; // placeholder: the dispatcher feeds the
-                                    // bank read data back here via arf_wdata_i
-                                    // naming is misleading; see dispatcher.
+  logic [31:0] eff_addr;
+  assign eff_addr = arf_use_i ? arf_rdata_i : alu_adder_result;
 
   // -------------------------------------------------------------------------
-  // Load/store: simple one-outstanding FSM. The effective address for a deref
-  // op is the ARF slot value; for a native lw/sw it is the ALU adder result.
+  // Load/store: one-outstanding FSM.  ldp.next / ldp / ldpcap do a load whose
+  // result writes back to the ARF slot (self-advance) and/or a GPR.
   // -------------------------------------------------------------------------
   typedef enum logic [1:0] {
     LS_IDLE,
@@ -143,9 +149,6 @@ module ibex_lane
   logic [31:0] ls_addr_q;
   logic [31:0] ls_wdata_q;
   logic        ls_we_q;
-  logic [4:0]  ls_waddr_q;
-  logic [31:0] ls_rdata;
-  logic        ls_done;
 
   always_comb begin
     ls_state_d = ls_state_q;
@@ -153,18 +156,16 @@ module ibex_lane
     data_we_o     = 1'b0;
     data_addr_o   = '0;
     data_wdata_o  = '0;
-    ls_done       = 1'b0;
 
     unique case (ls_state_q)
       LS_IDLE: begin
-        if (instr_valid_i && pred_guard_i && (is_load_i || is_store_i)) begin
+        if (instr_valid_i && guard && (is_load_i || is_store_i)) begin
           data_req_o   = 1'b1;
           data_we_o    = is_store_i;
-          data_addr_o  = arf_use_i ? arf_wdata_i : alu_adder_result;
+          data_addr_o  = eff_addr;
           data_wdata_o = operand_b_i;
           if (data_gnt_i) begin
             ls_state_d = is_store_i ? LS_IDLE : LS_WAIT_RVALID;
-            if (is_store_i) ls_done = 1'b1;
           end else begin
             ls_state_d = LS_WAIT_GNT;
           end
@@ -177,14 +178,10 @@ module ibex_lane
         data_wdata_o = ls_wdata_q;
         if (data_gnt_i) begin
           ls_state_d = ls_we_q ? LS_IDLE : LS_WAIT_RVALID;
-          if (ls_we_q) ls_done = 1'b1;
         end
       end
       LS_WAIT_RVALID: begin
-        if (data_rvalid_i) begin
-          ls_state_d = LS_IDLE;
-          ls_done    = 1'b1;
-        end
+        if (data_rvalid_i) ls_state_d = LS_IDLE;
       end
       default: ls_state_d = LS_IDLE;
     endcase
@@ -196,25 +193,20 @@ module ibex_lane
       ls_addr_q  <= '0;
       ls_wdata_q <= '0;
       ls_we_q    <= 1'b0;
-      ls_waddr_q <= '0;
     end else begin
       ls_state_q <= ls_state_d;
-      // capture request params when first issued
       if ((ls_state_q == LS_IDLE) && data_req_o) begin
         ls_addr_q  <= data_addr_o;
         ls_wdata_q <= data_wdata_o;
         ls_we_q    <= data_we_o;
-        ls_waddr_q <= rf_waddr_i;
       end
     end
   end
 
-  assign ls_rdata = data_rdata_i;
-  assign busy_o   = (ls_state_q != LS_IDLE);
+  assign busy_o = (ls_state_q != LS_IDLE);
 
   // -------------------------------------------------------------------------
   // Commit: GPR write from ALU result (non-load) or load data (load).
-  // Predicated — a false guard commits nothing.
   // -------------------------------------------------------------------------
   logic load_complete;
   assign load_complete = (ls_state_q == LS_WAIT_RVALID) && data_rvalid_i;
@@ -223,11 +215,10 @@ module ibex_lane
     commit_valid_o  = 1'b0;
     commit_waddr_o  = rf_waddr_i;
     commit_wdata_o  = alu_result;
-    if (instr_valid_i && rf_we_i && pred_guard_i) begin
+    if (instr_valid_i && rf_we_i && guard) begin
       if (is_load_i) begin
-        // load result commits when the response arrives
         commit_valid_o = load_complete;
-        commit_wdata_o = ls_rdata;
+        commit_wdata_o = data_rdata_i;
       end else begin
         commit_valid_o = 1'b1;
         commit_wdata_o = alu_result;
@@ -235,9 +226,23 @@ module ibex_lane
     end
 
     // Predicate write from a compare (only when the lane is active).
-    pred_we_o              = instr_valid_i & is_pred_set_i & pred_guard_i;
+    pred_we_o              = instr_valid_i & is_pred_set_i & guard;
     pred_waddr_commit_o    = pred_waddr_i;
     pred_wdata_commit_o    = alu_cmp_result;
   end
+
+  // -------------------------------------------------------------------------
+  // Branch / jump resolution (resolved, non-speculative — DESIGN.md §3.2).
+  // A conditional branch redirects iff its guard holds AND the comparison is
+  // true. JAL/JALR always redirect (guard is expected true). The target is
+  // PC+imm for branches/JAL, rs1+imm for JALR.
+  // -------------------------------------------------------------------------
+  logic do_branch;
+  assign do_branch = instr_valid_i & guard &
+                     (is_branch_i ? alu_cmp_result : is_jump_i);
+
+  assign branch_redirect_o = do_branch;
+  assign branch_target_o   = is_jump_i ? (operand_a_i + imm_i)   // JALR: rs1+imm
+                                       : (pc_i + imm_i);          // branch/JAL: PC+imm
 
 endmodule
