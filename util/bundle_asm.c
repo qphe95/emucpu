@@ -5,8 +5,8 @@
 // bundle_asm.c — a self-contained assembler for BPS-V VLIW bundles.
 //
 // Takes a simple assembly file, encodes each instruction to 32-bit RV32I +
-// the BPS-V ARF custom opcodes, packages W instructions into 64-bit bundle
-// slots (32-bit instr | (pred_idx<<32) | (invert<<36)), and emits:
+// the BPS-V ARF custom opcodes, packages W instructions into 32-bit bundle
+// words, and emits:
 //   - <name>.img    : flat binary of 64-bit little-endian slots, bundle 0
 //                     slot 0 first.
 //   - <name>.expect : expected GPR register file at halt, one "xN=hex" per
@@ -39,7 +39,7 @@ enum {
     C0_SLOTR=0, C0_PINA=1, C0_UNPIN=2, C0_LDP=3,
     C0_STP=4, C0_LDPI=5, C0_STPI=6, C0_LDP_NEXT=7,
     C1_SPHINT=0, C1_SPLR=1, C1_SPFREE=2, C1_SPALLOC=3,
-    C1_LDPCAP=4, C1_SPFLUSH=7, C1_WJ=5, C1_PCMP=6,
+    C1_LDPCAP=4, C1_SPFLUSH=7, C1_WJ=5,
 };
 
 // ---------------------------------------------------------------------------
@@ -235,59 +235,28 @@ static uint32_t encode_one(const char *mnem, char *ops[], int nops) {
     if (!strcmp(mnem,"splr"))    return enc_i(0,parse_reg(ops[1]),C1_SPLR,parse_reg(ops[0]),OPC_CUSTOM_1);
     if (!strcmp(mnem,"spflush")) return enc_i(0,0,C1_SPFLUSH,0,OPC_CUSTOM_1);
 
-    // Predicate ops: cmp.eq pK, ra, rb
-    if (!strncmp(mnem,"cmp.",4)) {
-        const char *cond = mnem+4;
-        int w3 = 0;
-        if (!strcmp(cond,"eq")) w3=0; else if (!strcmp(cond,"ne")) w3=1;
-        else if (!strcmp(cond,"lt")) w3=4; else if (!strcmp(cond,"ge")) w3=5;
-        else if (!strcmp(cond,"ltu")) w3=6; else if (!strcmp(cond,"geu")) w3=7;
-        // pK in rd field, ra in rs1, rb in rs2; funct7 = condition code.
-        return enc_r(w3, parse_reg(ops[2]), parse_reg(ops[1]), C1_PCMP,
-                     parse_reg(ops[0]), OPC_CUSTOM_1);
-    }
-    if (!strcmp(mnem,"mov.pt"))
-        return enc_r(0b0100000, parse_reg(ops[2]), 0, C1_PCMP, parse_reg(ops[0]), OPC_CUSTOM_1);
-    if (!strcmp(mnem,"mov.pf"))
-        return enc_r(0b0100001, parse_reg(ops[2]), 0, C1_PCMP, parse_reg(ops[0]), OPC_CUSTOM_1);
+    // No predication ops in v3.2 — branches are resolved in-place.
 
     fprintf(stderr, "unknown mnemonic: %s\n", mnem);
     exit(1);
 }
 
 // ---------------------------------------------------------------------------
-// Parse a guard prefix [pK] or [~pK] from the line; return rest-of-line.
-// ---------------------------------------------------------------------------
-static const char *parse_guard(const char *line, int *pred, int *invert) {
-    *pred = 0; *invert = 0;
-    if (line[0] == '[') {
-        const char *p = line + 1;
-        if (*p == '~') { *invert = 1; p++; }
-        if (*p == 'p' || *p == 'P') { *pred = atoi(p+1); }
-        while (*p && *p != ']') p++;
-        if (*p == ']') p++;
-        while (*p == ' ') p++;
-        return p;
-    }
-    return line;
-}
-
-// ---------------------------------------------------------------------------
 // Output buffers (dynamic)
 // ---------------------------------------------------------------------------
-static uint64_t *img_slots = NULL;
+static uint32_t *img_slots = NULL;
 static int img_count = 0, img_cap = 0;
 
 struct expect_entry { int is_mem; uint32_t idx; uint32_t val; };
 static struct expect_entry *exps = NULL;
 static int exp_count = 0, exp_cap = 0;
 
-static void img_push(uint64_t slot) {
+static void img_push(uint32_t word) {
     if (img_count >= img_cap) {
         img_cap = img_cap ? img_cap * 2 : 256;
-        img_slots = realloc(img_slots, img_cap * sizeof(uint64_t));
+        img_slots = realloc(img_slots, img_cap * sizeof(uint32_t));
     }
-    img_slots[img_count++] = slot;
+    img_slots[img_count++] = word;
 }
 static void exp_push(int is_mem, uint32_t idx, uint32_t val) {
     if (exp_count >= exp_cap) {
@@ -324,8 +293,8 @@ int main(int argc, char **argv) {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return 1; }
 
-    // Current bundle: array of (instr, pred, invert)
-    uint32_t cur_instr[256]; int cur_pred[256]; int cur_inv[256]; int cur_n = 0;
+    // Current bundle: array of instructions
+    uint32_t cur_instr[256]; int cur_n = 0;
     int nbundles = 0;
 
     char line[512];
@@ -347,13 +316,10 @@ int main(int argc, char **argv) {
             // any instructions is just a marker, not a real bundle).
             if (cur_n > 0) {
                 for (int i = cur_n; i < width; i++) {
-                    cur_instr[i] = enc_i(0,0,0,0,OPC_OP_IMM); cur_pred[i] = 0; cur_inv[i] = 0;
+                    cur_instr[i] = enc_i(0,0,0,0,OPC_OP_IMM);
                 }
                 for (int i = 0; i < width; i++) {
-                    uint64_t slot = (uint64_t)cur_instr[i] |
-                                    ((uint64_t)cur_pred[i] << 32) |
-                                    ((uint64_t)cur_inv[i] << 36);
-                    img_push(slot);
+                    img_push(cur_instr[i]);
                 }
                 nbundles++;
             }
@@ -365,7 +331,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < n; i++) {
                 if (cur_n < 256) {
                     cur_instr[cur_n] = enc_i(0,0,0,0,OPC_OP_IMM);
-                    cur_pred[cur_n] = 0; cur_inv[cur_n] = 0; cur_n++;
+                    cur_n++;
                 }
             }
             continue;
@@ -392,12 +358,9 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // Instruction
-        int pred = 0, invert = 0;
-        const char *rest = parse_guard(p, &pred, &invert);
-        // Split mnemonic + operands
+        // Instruction (no guard prefix — no predication in v3.2)
         char buf[512];
-        strncpy(buf, rest, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
+        strncpy(buf, p, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
         char *space = strchr(buf, ' ');
         char *mnem, *ops_str = NULL;
         if (space) { *space = '\0'; mnem = buf; ops_str = space + 1; }
@@ -409,8 +372,6 @@ int main(int argc, char **argv) {
         uint32_t instr = encode_one(mnem, ops, nops);
         if (cur_n < 256) {
             cur_instr[cur_n] = instr;
-            cur_pred[cur_n] = pred;
-            cur_inv[cur_n] = invert;
             cur_n++;
         }
     }
@@ -419,13 +380,10 @@ int main(int argc, char **argv) {
     // Flush last bundle
     if (cur_n > 0) {
         for (int i = cur_n; i < width; i++) {
-            cur_instr[i] = enc_i(0,0,0,0,OPC_OP_IMM); cur_pred[i] = 0; cur_inv[i] = 0;
+            cur_instr[i] = enc_i(0,0,0,0,OPC_OP_IMM);
         }
         for (int i = 0; i < width; i++) {
-            uint64_t slot = (uint64_t)cur_instr[i] |
-                            ((uint64_t)cur_pred[i] << 32) |
-                            ((uint64_t)cur_inv[i] << 36);
-            img_push(slot);
+            img_push(cur_instr[i]);
         }
         nbundles++;
     }
@@ -436,8 +394,8 @@ int main(int argc, char **argv) {
     FILE *of = fopen(outpath, "wb");
     if (!of) { fprintf(stderr, "cannot write %s\n", outpath); return 1; }
     for (int i = 0; i < img_count; i++) {
-        uint64_t s = img_slots[i];
-        for (int b = 0; b < 8; b++) fputc((s >> (b*8)) & 0xff, of);
+        uint32_t w = img_slots[i];
+        for (int b = 0; b < 4; b++) fputc((w >> (b*8)) & 0xff, of);
     }
     fclose(of);
 
@@ -454,7 +412,7 @@ int main(int argc, char **argv) {
     fclose(of);
 
     printf("assembled %d bundles (%d slots, %d bytes) -> %s.img\n",
-           nbundles, nbundles*width, nbundles*width*8, stem);
+           nbundles, nbundles*width, nbundles*width*4, stem);
     printf("%d expectations -> %s.expect\n", exp_count, stem);
 
     return 0;

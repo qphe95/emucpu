@@ -46,27 +46,20 @@ static bool ext_pending = false;   // a load response is due
 static uint32_t ext_pending_addr = 0;
 
 // ---------------------------------------------------------------------------
-// Load a flat image of 64-bit little-endian slots into a vector of words.
-// Each slot = one (instr, pred, invert) triple.
+// Load a flat image of 32-bit little-endian instructions.
 // ---------------------------------------------------------------------------
-struct Slot { uint32_t instr; uint8_t pred; uint8_t invert; };
-
-static std::vector<Slot> load_image(const char *path) {
+static std::vector<uint32_t> load_image(const char *path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
                                 std::istreambuf_iterator<char>());
-    std::vector<Slot> slots;
-    for (size_t i = 0; i + 8 <= bytes.size(); i += 8) {
-        uint64_t slot = 0;
-        for (int b = 0; b < 8; b++) slot |= (uint64_t)bytes[i+b] << (b*8);
-        Slot s;
-        s.instr  = (uint32_t)(slot & 0xffffffff);
-        s.pred   = (slot >> 32) & 0x7;
-        s.invert = (slot >> 36) & 0x1;
-        slots.push_back(s);
+    std::vector<uint32_t> words;
+    for (size_t i = 0; i + 4 <= bytes.size(); i += 4) {
+        uint32_t w = 0;
+        for (int b = 0; b < 4; b++) w |= (uint32_t)bytes[i+b] << (b*8);
+        words.push_back(w);
     }
-    return slots;
+    return words;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +116,7 @@ int main(int argc, char **argv) {
     tfp->open("vliw_trace.vcd");
 #endif
 
-    std::vector<Slot> slots = load_image(img_path);
+    std::vector<uint32_t> words = load_image(img_path);
     std::vector<Expect> exps = load_expect(exp_path);
 
     // ---- Fill-state machine: load slots into the bundle cache one per cycle.
@@ -156,16 +149,13 @@ int main(int argc, char **argv) {
 
     while (cyc < max_cycles && !halted) {
         // ---- Phase 1: bundle-cache fill (one slot per cycle via fill port).
-        if (!fill_done && fill_idx < (int)slots.size()) {
+        if (!fill_done && fill_idx < (int)words.size()) {
             int bank = fill_idx % width;
             int addr = fill_idx / width;
-            uint64_t slot = (uint64_t)slots[fill_idx].instr |
-                            ((uint64_t)slots[fill_idx].pred << 32) |
-                            ((uint64_t)slots[fill_idx].invert << 36);
             dut->fill_req_i    = 1;
             dut->fill_bank_i   = bank;
             dut->fill_addr_i   = addr;
-            dut->fill_wdata_i  = slot;
+            dut->fill_wdata_i  = words[fill_idx];
         } else {
             dut->fill_req_i = 0;
             if (!fill_done) fill_done = true;
@@ -207,7 +197,7 @@ int main(int argc, char **argv) {
         cyc++;
 
         // ---- Advance fill index after the write. ----
-        if (dut->fill_req_i && fill_idx < (int)slots.size()) {
+        if (dut->fill_req_i && fill_idx < (int)words.size()) {
             fill_idx++;
         }
 

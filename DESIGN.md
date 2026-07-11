@@ -76,89 +76,76 @@ The "simplest one‑cycle" Ibex is the **`small`** config in `ibex_configs.yaml`
 
 ---
 
-## 3. Control flow: no prediction, predication instead
+## 3. Control flow: a PC‑driven VLIW with dynarec fuse/unfuse
 
-Because the engine is wide and not speculative, the dynarec has two tools to handle control flow, neither
-of which ever produces a mispredict:
+The engine has a **program counter** and resolves branches in hardware — there is **no branch prediction**
+and **no predication**. The dynarec owns scheduling and adapts to observed branch behavior by **fusing and
+unfusing** code regions into and out of bundles at runtime.
 
-### 3.1 Predication (primary mechanism)
+### 3.1 How it works: the PC and resolved branches
 
-For a conditional branch whose arms are short enough to lay out side‑by‑side, the dynarec **does not emit a
-branch at all.** It emits both arms as operations in the same bundle (or adjacent bundles) and guards each
-with a **predicate register** `p0..p7` (8 predicate bits, part of the architectural state). A lane whose
-predicate is false **commits nothing** (its result is discarded); the join is a guarded select.
+The core has a single bundle PC. Each cycle, the engine fetches the bundle at `pc`, executes all `W` lanes,
+and advances:
 
-```
-# C:  if (cond) x = a; else x = b;        — flattened, no branch:
-    cmp.eq  p0, ra, rb          # p0 = cond
-    mov.pt  p0, rx, ra          # if p0:  x <- a
-    mov.pf  p0, rx, rb          # if !p0: x <- b
-```
+- **No branch taken in the bundle:** `pc ← pc + bundle_bytes` (sequential).
+- **A branch taken in the bundle:** `pc ← resolved_target` (set by the lane that evaluated the branch).
 
-Width 1000 makes predication cheap: the "wasted" lanes on the not‑taken arm are a small fraction of the
-bundle, and *both arms complete in one cycle with zero redirect*. This is the general answer to "how do you
-avoid branch stalls on a wide machine" — don't have the branch.
+Branch conditions resolve **in the same cycle the bundle executes** (single‑cycle ALU + comparison). The
+resolved target — either the fall‑through or the branch target — becomes the next bundle's PC. There is no
+prediction, so there is never a wrong‑path fetch to squash. The redirect is deterministic: it fires exactly
+when the branch condition is true, which is a resolved fact by the time the PC updates.
 
-### 3.2 Resolved redirect (secondary mechanism)
+This is a **VLIW with a program counter** — the same model as classic VLIW (Multiflow, TI C6000): bundles
+are the atomic issue unit, but control flow is sequential with resolved branches, not predicated.
 
-When a region is too large to predicate (a loop exit, a function call, a deep diverge), the dynarec emits
-an actual branch. The branch condition resolves **in the same cycle the bundle executes** (single‑cycle
-lanes); the resolved target becomes the next bundle's PC. The dynarec knows this 1‑cycle redirect latency
-and either fills the intervening fetch slot with independent work (a **software delay slot**) or accepts a
-single‑bubble redirect. There is **no prediction**, so there is never a wrong‑path fetch to squash — the
-redirect is deterministic, not speculative.
+### 3.2 Dynarec fuse/unfuse: adapting to branch direction at runtime
+
+The dynarec observes which way branches go and re‑lays‑out the code accordingly:
+
+**Fusing (branch resolves not‑taken → fall‑through).** When the dynarec sees a conditional branch that
+consistently falls through, it **fuses** the fall‑through code into the same bundle stream as the code
+before the branch. The branch instruction still executes (it evaluates the condition), but because it
+resolves not‑taken, `pc` advances sequentially and the fall‑through bundle executes next with **zero
+redirect cost**. The dynarec packs independent ops from both sides of the (not‑taken) branch into the same
+bundles, maximizing lane utilization.
+
+**Unfusing (branch resolves taken → split).** When a branch goes taken, the dynarec **unfuses** — it emits
+the branch as the last op in its bundle, and the taken target becomes the next bundle's PC (a 1‑cycle
+resolved redirect). The dynarec places independent work in the redirect's delay slot if available, or
+accepts the single‑cycle bubble.
+
+**Hot‑path optimization.** The dynarec's trace selector identifies hot paths (loops, common branches) and
+fuses them into long straight‑line bundle sequences. Cold paths stay unfused (split at the branch). As
+runtime behavior shifts, the dynarec re‑fuses or re‑unfuses — this is the same binary‑translation feedback
+loop used by dynamic optimizers (HP Dynamo, Apple's Rosetta trace formation).
 
 ### 3.3 Why this satisfies the original requirement
 
 | Mechanism | Stall on the branch? | Mispredict? |
 |---|---|---|
-| Predicate both arms | **0 cycles** (one bundle does both) | impossible — no branch emitted |
-| Resolved redirect + dynarec delay slot | **0 cycles** (delay slot filled with useful work) | impossible — nothing guessed |
-| Resolved redirect, unfilled | 1 cycle | impossible |
+| Fused fall‑through (branch resolves not‑taken) | **0 cycles** (sequential PC advance, both sides packed) | impossible — nothing guessed |
+| Unfused taken branch + dynarec delay slot | **0 cycles** (delay slot filled with useful work) | impossible — nothing guessed |
+| Unfused taken branch, unfilled | 1 cycle | impossible |
 
-There is no row for "mispredict penalty" because the concept does not exist in this machine. v1 achieved
-"mispredicts cost one fetch slot"; v3 achieves **"there are no mispredicts."** This is the cleanest
-realization of the stated goal, and it is only possible because the dynarec — not the hardware — owns
-scheduling and the core makes no guesses.
+There is no row for "mispredict penalty" because the concept does not exist in this machine. The dynarec
+optimizes for the *observed* branch direction — fusing the hot path so it runs at zero redirect cost —
+and the hardware simply resolves the branch in‑place. No predictor, no speculation, no flush.
 
-### 3.4 Memory‑event control transfer: wait/jump on MMIO write (no polling, no prediction)
+### 3.4 Memory‑event control transfer: wait/jump on MMIO write
 
-The third control‑flow mechanism (besides predication §3.1 and resolved redirect §3.2) is for **memory‑mapped
-I/O and device handshakes**: "block this lane until address `A` is written, then go to PC `P`." This is the
-classical device‑ready / DMA‑complete / mailbox pattern. On a normal CPU you'd implement it as a **polling
-loop** (`while (mmio[A] != done);`), which on this machine is especially bad: a polling loop is a *branch
-the dynarec must schedule around*, and on a wide engine it burns a lane every cycle doing nothing. Polling
-also forces the data‑memory bus to serve a useless read every iteration, contending with real work.
+For **memory‑mapped I/O and device handshakes** — "block until address `A` is written, then go to PC `P`" —
+the core provides a hardware wait/jump instead of a polling loop:
 
-Instead the core provides a **memory‑event wait/jump** that moves the synchronization into hardware:
-
-- **`wjeq  pK, si, rs2, P`** — *wait‑jump‑if‑equal*: watch ARF slot `si`; when `MEM[ S[si] ] == rs2`,
-  set predicate `pK` and set the next bundle PC to `P`. Until then, **the issuing lane suspends** (its
-  predicate stays false, it emits no data‑memory request), and the bundle re‑fetches only when the watched
-  condition may have changed (see below). `si` holds the MMIO address (it's an ordinary pinned address);
+- **`wjeq  si, rs2, P`** — watch ARF slot `si`; when `MEM[ S[si] ] == rs2`, set the next bundle PC to `P`.
+  Until then, the issuing lane suspends (emits no data‑memory request). `si` holds the MMIO address;
   `rs2` is the sentinel value the device writes when ready.
-- **`wjne pK, si, rs2, P`** — same, condition `!=`.
-- **`wset  pK, si, P`** — *wait‑jump‑on‑bit‑set*: watch `MEM[ S[si] ]`; when any bit set in a mask `rs2`
-  becomes 1, set `pK` and jump to `P`. (Status‑register form; mask in `rs2`.)
+- **`wjne si, rs2, P`** — same, condition `!=`.
+- **`wset si, rs2, P`** — same, bit‑set form `(MEM[S[si]] & rs2) != 0`.
 
-These are **not polls**. The hardware holds the lane in a suspended state and is woken by the memory system
-when the watched address is written by a device — specifically, when the LSU observes a store to `S[si]`
-arriving on the `data_*` bus from a device/master (MMIO writes are bus transactions the core already sees).
-On wake, the lane re‑reads `MEM[ S[si] ]` once to test the condition, and if met, commits the predicate +
-PC change. No per‑cycle memory traffic, no scheduled branch, no mispredict (the transfer is deterministic:
-it fires exactly when the device writes, never speculatively).
-
-**Wider‑engine note.** Because this is a per‑lane suspension, the other `W−1` lanes keep executing — only
-the lane that issued the `wj*` stalls. This is the key property that makes device waits cheap on a wide
-static engine: a single blocked lane does not halt the bundle unless it's on the critical path, and the
-dynarec will typically schedule the `wj*` on a lane with no dependents so the wait is fully hidden. If the
-bundle *does* need the wait's result to proceed (bundle‑completion gating, §7.3), the whole bundle waits —
-but only until the single device write, not for `Lmem` of polling.
-
-**Relationship to the no‑prediction property.** Like the other control mechanisms, `wj*` never guesses: it
-transfers control *in response to* an observed event, not a prediction of one. There is no wrong‑path
-fetch to squash; the next bundle PC is either `current + 1` (the wait hasn't fired) or `P` (the device wrote
-— a resolved fact).
+These are **not polls**. The hardware holds the lane in a suspended state and is woken when the LSU
+observes a store to `S[si]` arriving on the `data_*` bus. No per‑cycle memory traffic, no branch to
+schedule around. Like all control flow in this machine, `wj*` never guesses — it transfers control in
+response to an observed event.
 
 ---
 
@@ -261,7 +248,7 @@ loop:
     ldp.next  0x2000        # advance p = p->next           (no GPR, no addr‑compute)
     ldp  t0, 0x2000         # load p->data into a GPR       (address from slot, data to RF)
     ... use t0 ...
-    bnez ?, loop            # (or: predicate the whole loop — see §3)
+    bnez ?, loop            # resolved branch; dynarec fuses the loop body
 ```
 
 The ALU address‑compute cycle of `lw` is gone, **and** the working pointer never occupies a GPR. With `W`
@@ -413,14 +400,15 @@ workload like a single pointer chase, the machine fetches a handful of instructi
 memory — fetch bandwidth is not the bottleneck there. Fetch bandwidth becomes the limiter only on
 wide, compute‑heavy, straight‑line code (the §C multi‑stream case), which is exactly the workload this
 machine targets.
-- **`W` ALU lanes** in lockstep. Each lane: predicate check → ALU → optional ARF slot read/write →
-  optional data‑memory request. A lane whose predicate is false discards its result.
-- **8 predicate registers `p0..p7`**, part of architectural state, written by compare ops, read as lane
-  guards and by guarded `mov.pt`/`mov.pf`/select ops.
+- **`W` ALU lanes** in lockstep. Each lane: ALU → optional ARF slot read/write → optional data‑memory
+  request. **All lanes always execute** (no predication) — the dynarec ensures every slot in a bundle has
+  useful work (or an explicit NOP).
 - **Banked data memory: `#banks ≥ W`** (same double‑clocked banking as the ARF) feeding the lanes' LSU
   ports. Stores commit in program (bundle) order; loads issue as the dynarec scheduled them.
 - **Single in‑order commit register** per architectural GPR: the last writer in a bundle wins; results land
   at the end of the bundle. No reorder needed because the dynarec already ordered everything.
+- **Resolved branch redirect**: if any lane's branch evaluates taken, the next bundle PC is set to the
+  resolved target (§3.1). The dynarec fuses fall‑through paths so hot branches pay zero redirect cost.
 
 ### 7.3 Bundle execution semantics
 
@@ -444,7 +432,7 @@ A bundle is the atomic unit of forward progress:
 | `ibex_load_store_unit.sv` | widened to `W` LSU ports over the banked data memory |
 | `ibex_controller.sv` | retained for exception/redirect, fed by resolved (non‑speculative) branches |
 | `ibex_branch_predict.sv` | **uninstantiated** (`BranchPredictor = 0` permanently) |
-| **new** | `ibex_addr_regfile.sv`, `ibex_hot_addr_detect.sv`, `ibex_bundle_cache.sv`, `ibex_lane.sv`, `ibex_predicate.sv`, `ibex_mem_event_watch.sv` (per‑lane MMIO‑write wait/wake, §3.4) |
+| **new** | `ibex_addr_regfile.sv`, `ibex_hot_addr_detect.sv`, `ibex_bundle_cache.sv`, `ibex_lane.sv`, `ibex_mem_event_watch.sv` (per‑lane MMIO‑write wait/wake, §3.4) |
 
 ---
 
@@ -480,7 +468,7 @@ address‑compute bubble and there are still never any mispredicts.
 ## 10. Microarchitecture (block diagram)
 
 ```
-                ┌──────── ibex_core (v3.1, W=32 on PG2T390H, statically dispatched) ──┐
+                ┌──── ibex_core (v3.2, W=32 on PG2T390H, PC-driven VLIW, no predication) ──┐
                 │                                                                     │
   clk_sram_2x ──┼─▶ ┌──── ibex_addr_regfile: 64 banks × 2048 × 32 (128K entries) ───┐│
                 │   │   metadata stripe (valid/free/LRU/free‑list) in‑array         ││
@@ -493,8 +481,8 @@ address‑compute bubble and there are still never any mispredicts.
                 │       next bundle PC = dynarec‑dictated (resolved branch or       │
                 │       sequential); NO predictor                                    │
                 │                          ▼                                          │
-                │   W LANES (lockstep): pred‑guard → ALU → ARF r/w → LSU            │
-                │       predicates p0..p7                                            │
+                │   W LANES (lockstep): ALU → ARF r/w → LSU                          │
+                │       resolved branch → PC redirect (dynarec fuse/unfuse)          │
                 │                          ▼                                          │
                 │   BANKED LSU (W ports) ─▶ #banks‑bank data mem ─▶ data bus        │
                 │                          ▼                                          │
@@ -528,7 +516,8 @@ independent chains; (c) optionally split the engine into a few independent sub�
 other (a middle ground between full lockstep and full OoO). This is the design's central performance risk.
 
 **Restored, not lost: the mispredict property.** v2 reintroduced a large mispredict penalty. v3 **removes
-misprediction entirely** — there is no predictor to be wrong. Branches are predicated or resolved‑with‑delay.
+misprediction entirely** — there is no predictor to be wrong. Branches are resolved in‑place (§3.1) and
+the dynarec fuses hot fall‑through paths to eliminate redirect cost.
 This is the strongest form of the original requirement; the trade is that predication wastes lanes on the
 not‑taken arm and the dynarec must be good at scheduling.
 
@@ -569,9 +558,9 @@ generic `ram_2p_cfg_req_t` and avoids the name.
 **Phase 3 — Bank the ARF (still single issue).** Scale `ibex_addr_regfile.sv` to 64 banks (the PG2T390H
 instance); lane↔bank crossbar; phase‑A/B arbitration. Proves the banking in‑isolation.
 
-**Phase 4 — Predication + memory‑event waits.** Add `p0..p7` + `cmp.*→p`, `mov.pt`/`mov.pf`, guarded
-lanes; add the `wj*` wait/jump instructions and the per‑lane suspend + bus‑write‑wake logic in the LSU
-(`ibex_controller.sv` resolves the PC transfer on wake). Still single lane.
+**Phase 4 — Memory‑event waits + branch resolution.** Add the `wj*` wait/jump instructions and the
+per‑lane suspend + bus‑write‑wake logic in the LSU; wire branch decision/target from the lanes to the
+dispatcher for resolved PC redirect (§3.1). Still single lane.
 
 **Phase 5 — Widen to the static dispatcher.** `SuperscalarWidth` param; `W`‑bank bundle cache
 (`ibex_bundle_cache.sv`); `W`‑lane decode + `W` `ibex_lane`s in lockstep; banked data memory; widened LSU.
@@ -582,7 +571,7 @@ packer, latency slotter, bank‑conflict‑free slot assigner, predication pass,
 
 **Phase 7 — Verification.** DV: walk correctness vs `lw`/`sw` reference; bundle‑atomic execution; bank‑conflict
 trap; predication equivalence; consistency under interrupts and privilege change. Formal: extend the
-custom‑opcode excludes (cf. recent counter‑alias commits) to ARF ops and predicate guards.
+custom‑opcode excludes (cf. recent counter‑alias commits) to ARF ops and branch resolution.
 
 ---
 
@@ -593,7 +582,7 @@ This is the concrete target. The part's total budget, from Pango's Titan‑2 fam
 | Resource | PG2T390H total | BPS‑V instance (W=32, ARF=128K) | % of part |
 |---|---|---|---|
 | LUT6 | 243,600 | ~16–22K (controller + 32 lanes + crossbar + decode) | ~7–9% |
-| Flip‑flops | 487,200 | ~30–45K (pipeline regs, predicate file, lane state) | ~7–9% |
+| Flip‑flops | 487,200 | ~30–45K (pipeline regs, lane state) | ~7–9% |
 | Block RAM (36 Kb) | 480 (≈17.28 Mbit) | **128 ARF + ~64 instruction banks + ~200 data mem ≈ 392** | ARF 27% + instr 13% + data 42% ≈ **82%** |
 | DSP (APM, 18×25) | 840 | few (mul in lanes, if needed) | <5% |
 | PLL | 20 (10 GPLL + 10 PPLL) | 1 (for `clk_sram_2x`) | 5% |
@@ -608,7 +597,7 @@ comfortably above the 32 reads/cycle the target width needs. If `W` were pushed 
 = 2 × 36 Kb BSRAM (one 32‑bit‑wide × 2 K‑deep true‑dual‑port block). This is the §4.1 geometry, realized in
 the chip's actual 36 Kb BRAMs.
 
-**Why `W = 32` and not wider.** Per‑lane cost (~400–600 LUT incl. predicate + ARF port + LSU port) is not the
+**Why `W = 32` and not wider.** Per‑lane cost (~400–600 LUT incl. ARF port + LSU port) is not the
 binding constraint — routing congestion and the **`W`×`#banks` lane↔bank crossbar** are. At `W = 32`,
 `#banks = 64`: a 32×64 crossbar that place‑and‑route can close timing on. Each doubling of `W` roughly
 quadruples the crossbar congestion; `W = 64` is a stretch (re‑floorplan + pipelined crossbar), `W = 128` is
@@ -639,7 +628,7 @@ Each step is a parameter change, not a redesign.
 
 ```
 # All gated by AddrRegFile; illegal_insn otherwise. si = rs1[16:0] (17-bit, 128K) or imm12.
-# Predicates p0..p7 guard any lane op.
+# No predication — all lanes always execute (NOPs fill empty slots).
 
 # Raw slot access (full 128K)
 slotr  rd, rs1            # rd  <- S[rs1]
@@ -662,17 +651,18 @@ ldp.next si              # S[si] <- MEM[ S[si] ]            ; p = *p
 ldpcap rd, rs1           # rd <- MEM[S[rs1]] ; S[rs1] <- MEM[S[rs1]]
 
 # Memory‑event control transfer — wait/jump on MMIO write (no polling)
-wjeq  pK, si, rs2, P      # watch S[si]; when MEM[S[si]]==rs2: pK=1, goto P  (lane suspends until)
-wjne  pK, si, rs2, P      # same, condition !=
-wset  pK, si, rs2, P      # same, condition = (MEM[S[si]] & rs2) != 0   (bit‑set form)
+wjeq  si, rs2, P          # watch S[si]; when MEM[S[si]]==rs2: goto P  (lane suspends until)
+wjne  si, rs2, P          # same, condition !=
+wset  si, rs2, P          # same, condition = (MEM[S[si]] & rs2) != 0   (bit‑set form)
 
-# Predication (replaces most branches)
-cmp.eq  pK, ra, rb        # pK <- (ra == rb)        ; K in 0..7
-mov.pt  pK, rd, rs        # if pK:  rd <- rs
-mov.pf  pK, rd, rs        # if !pK: rd <- rs
+# Branches (resolved in‑place, §3.1; dynarec fuses/unfuses)
+beq/bne/blt/bge/bltu/bgeu rs1, rs2, P    # if cond: next bundle PC = P
+jal   rd, P                              # rd <- pc+4; next bundle PC = P
+jalr  rd, rs1, imm                       # rd <- pc+4; next bundle PC = rs1+imm
 
 # Hybrid‑spill introspection (CUSTOM-1)
 sphint rd, rs1            # hint: rs1 is hot
 splr   rd, rs1            # read metadata/LRU for slot rs1
 spflush                  # drain recommendation queue into metadata stripe
 ```
+

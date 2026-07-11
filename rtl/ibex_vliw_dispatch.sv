@@ -104,7 +104,7 @@ module ibex_vliw_dispatch
   // =========================================================================
   // Bundle fetch.
   // =========================================================================
-  logic [W-1:0][63:0] fetch_slot;
+  logic [W-1:0][31:0] fetch_slot;
   logic               fetch_valid;
   logic               fetch_req;
 
@@ -125,7 +125,7 @@ module ibex_vliw_dispatch
     .clk_sram_2x_i   (clk_sram_2x_i),
     .fetch_req_i     (fetch_req),
     .fetch_pc_i      (pc_q),
-    .fetch_slot_o    (fetch_slot),
+    .fetch_instr_o   (fetch_slot),
     .fetch_valid_o   (fetch_valid),
     .redirect_i      (redirect),
     .redirect_pc_i   (redirect_pc),
@@ -159,16 +159,10 @@ module ibex_vliw_dispatch
   end
 
   // =========================================================================
-  // Split each 64-bit slot into instruction + predicate control.
+  // Fetch slot is now 32-bit instructions directly (no predicate fields).
   // =========================================================================
   logic [W-1:0][31:0] slot_instr;
-  logic [W-1:0][2:0]  slot_pred_idx;
-  logic [W-1:0]       slot_pred_invert;
-  for (genvar l = 0; l < W; l++) begin : g_slot_split
-    assign slot_instr[l]       = fetch_slot[l][31:0];
-    assign slot_pred_idx[l]    = fetch_slot[l][34:32];
-    assign slot_pred_invert[l] = fetch_slot[l][36];
-  end
+  assign slot_instr = fetch_slot;
 
   // =========================================================================
   // W decoders.
@@ -257,20 +251,8 @@ module ibex_vliw_dispatch
   end
 
   // =========================================================================
-  // Predicate file.
   // =========================================================================
-  logic [NUM_PRED-1:0] pred_rdata;
-  logic [NUM_PRED-1:0] pred_we, pred_wdata;
-  ibex_predicate u_predicate (
-    .clk_i       (clk_i),
-    .rst_ni      (rst_ni),
-    .pred_rdata_o(pred_rdata),
-    .pred_we_i   (pred_we),
-    .pred_wdata_i(pred_wdata)
-  );
-
-  // =========================================================================
-  // VLIW data register file.
+  // VLIW data register file. (No predicate file — v3.2 removed predication.)
   // =========================================================================
   logic [W-1:0][4:0]          rf_raddr_a, rf_raddr_b, rf_waddr;
   logic [W-1:0][DataWidth-1:0] rf_rdata_a, rf_rdata_b;
@@ -401,9 +383,6 @@ module ibex_vliw_dispatch
   logic [W-1:0] lane_busy, lane_commit_valid;
   logic [W-1:0][4:0]  lane_commit_waddr;
   logic [W-1:0][DataWidth-1:0] lane_commit_wdata;
-  logic [W-1:0] lane_pred_we;
-  logic [W-1:0][2:0] lane_pred_waddr;
-  logic [W-1:0] lane_pred_wdata;
   logic [W-1:0] lane_redirect;
   logic [W-1:0][31:0] lane_target;
 
@@ -421,11 +400,6 @@ module ibex_vliw_dispatch
       .rf_waddr_i         (dec_rf_waddr[l]),
       .is_load_i          (dec_data_req[l] & ~dec_data_we[l]),
       .is_store_i         (dec_data_req[l] &  dec_data_we[l]),
-      .pred_bits_i        (pred_rdata),
-      .pred_idx_i         (slot_pred_idx[l]),
-      .pred_invert_i      (slot_pred_invert[l]),
-      .is_pred_set_i      (dec_branch[l]),
-      .pred_waddr_i       (arf_pred[l]),
       .arf_use_i          (arf_en[l]),
       .arf_we_i           (arf_we[l]),
       .arf_idx_i          (arf_lane_idx[l]),
@@ -447,9 +421,6 @@ module ibex_vliw_dispatch
       .commit_valid_o     (lane_commit_valid[l]),
       .commit_waddr_o     (lane_commit_waddr[l]),
       .commit_wdata_o     (lane_commit_wdata[l]),
-      .pred_we_o          (lane_pred_we[l]),
-      .pred_waddr_commit_o(lane_pred_waddr[l]),
-      .pred_wdata_commit_o(lane_pred_wdata[l]),
       .busy_o             (lane_busy[l])
     );
   end
@@ -464,18 +435,6 @@ module ibex_vliw_dispatch
   // RF read addresses = decoder outputs.
   assign rf_raddr_a = dec_rf_raddr_a;
   assign rf_raddr_b = dec_rf_raddr_b;
-
-  // Predicate write: OR across lanes (dynarec guarantees ≤1 writer per pred).
-  always_comb begin
-    pred_we     = '0;
-    pred_wdata  = '0;
-    for (int l = 0; l < W; l++) begin
-      if (lane_pred_we[l]) begin
-        pred_we[lane_pred_waddr[l]]    = 1'b1;
-        pred_wdata[lane_pred_waddr[l]] = lane_pred_wdata[l];
-      end
-    end
-  end
 
   // =========================================================================
   // Bundle completion gating: a bundle is done when no lane is busy.
