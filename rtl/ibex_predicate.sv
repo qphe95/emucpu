@@ -35,7 +35,10 @@ module ibex_predicate
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      pred_q <= '0;
+      // pred[0] is the unconditional predicate: reset to 1 so unguarded
+      // instructions (pred index 0, no invert) execute by default.
+      pred_q[0] <= 1'b1;
+      for (int p = 1; p < NumPred; p++) pred_q[p] <= 1'b0;
     end else begin
       for (int p = 0; p < NumPred; p++) begin
         if (pred_we_i[p]) pred_q[p] <= pred_wdata_i[p];

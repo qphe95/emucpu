@@ -972,6 +972,7 @@ module ibex_core import ibex_pkg::*, ibex_bps_pkg::*; #(
       .data_rdata_i   (data_rdata_i),
       .data_err_i     (data_err_i),
       .illegal_insn_o (vliw_illegal_insn),
+      .halted_o       (),
       .bcache_cfg_i   (bcache_cfg_req),
       .bcache_cfg_o   (bcache_cfg_rsp),
       .dmem_cfg_i     (dmem_cfg_req),

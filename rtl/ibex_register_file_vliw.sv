@@ -36,14 +36,9 @@ module ibex_register_file_vliw #(
 
   localparam int unsigned NumRegs = RV32E ? 16 : 32;
 
-  logic [DataWidth-1:0] rf [NumRegs];
+  logic [DataWidth-1:0] rf [NumRegs] /* verilator public */;
 
-  // Zero-initialize for simulation.
-  initial begin
-    for (int i = 0; i < NumRegs; i++) rf[i] = '0;
-  end
-
-  // Synchronous writes.
+  // Synchronous writes (reset clears all registers).
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       for (int i = 0; i < NumRegs; i++) rf[i] <= '0;

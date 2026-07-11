@@ -63,6 +63,7 @@ module ibex_vliw_dispatch
 
   // ---- Exception reporting ----
   output logic              illegal_insn_o,
+  output logic              halted_o,
 
   // ---- SRAM vendor sideband ----
   input  ram_2p_cfg_req_t   bcache_cfg_i [SuperscalarWidth],
@@ -90,13 +91,29 @@ module ibex_vliw_dispatch
   end
 
   // =========================================================================
+  // Halt: any lane decoding ebreak while active latches a halt. Once halted,
+  // the engine stops fetching and bundle_active drains.
+  // =========================================================================
+  logic halted_q;
+  wire  halt_set = bundle_active & (|(dec_ebrk & {W{1'b1}}));
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)   halted_q <= 1'b0;
+    else if (halt_set) halted_q <= 1'b1;
+  end
+
+  // =========================================================================
   // Bundle fetch.
   // =========================================================================
   logic [W-1:0][63:0] fetch_slot;
   logic               fetch_valid;
   logic               fetch_req;
 
-  assign fetch_req = fetch_enable_i & (~bundle_active | all_lanes_done | redirect);
+  // fetch_req is a one-cycle pulse: fire only when no fetch is outstanding
+  // (fetch_valid not yet returned) and the engine is between bundles. This
+  // freezes the RAM output so the decoders see stable slot data when
+  // bundle_active latches.
+  assign fetch_req = fetch_enable_i & ~halted_q & ~fetch_valid_q &
+                     (~bundle_active | all_lanes_done | redirect);
 
   ibex_bundle_cache #(
     .Width     (W),
@@ -120,11 +137,25 @@ module ibex_vliw_dispatch
     .cfg_o           (bcache_cfg_o)
   );
 
-  // A fetched bundle becomes active the cycle after fetch_valid.
+  // A fetched bundle becomes active the cycle after fetch_valid.  Track
+  // fetch_valid in a register so fetch_req doesn't re-fire while the bundle
+  // is in flight (one-cycle pulse semantics). The bundle stays active for at
+  // least one execution cycle (bundle_active_q) before all_lanes_done can
+  // retire it — otherwise a bundle of all-ALU-ops completes instantly without
+  // ever presenting bundle_active=1 to the lanes.
+  logic fetch_valid_q;
+  logic bundle_active_q;   // bundle_active registered: the "first execute cycle"
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni)              bundle_active <= 1'b0;
-    else if (fetch_valid)     bundle_active <= 1'b1;
-    else if (all_lanes_done)  bundle_active <= 1'b0;
+    if (!rst_ni) begin
+      bundle_active   <= 1'b0;
+      bundle_active_q <= 1'b0;
+      fetch_valid_q   <= 1'b0;
+    end else begin
+      fetch_valid_q   <= fetch_valid;
+      bundle_active_q <= bundle_active;
+      if (fetch_valid)               bundle_active <= 1'b1;
+      else if (all_lanes_done)       bundle_active <= 1'b0;
+    end
   end
 
   // =========================================================================
@@ -147,6 +178,7 @@ module ibex_vliw_dispatch
   logic [W-1:0]                 dec_rf_ren_a, dec_rf_ren_b, dec_rf_we;
   logic [W-1:0]                 dec_data_req, dec_data_we;
   logic [W-1:0]                 dec_jump, dec_branch;
+  logic [W-1:0]                 dec_ebrk;
   ibex_pkg::alu_op_e            dec_alu_op [W-1:0];
   logic [W-1:0][31:0]           dec_imm_i;
   logic [W-1:0]                 arf_en, arf_we, arf_deref, arf_is_ldp_next;
@@ -163,7 +195,7 @@ module ibex_vliw_dispatch
       .illegal_c_insn_i   (1'b0),
       .instr_rdata_i      (slot_instr[l]),
       .illegal_insn_o     (dec_illegal[l]),
-      .ebrk_insn_o        (),
+      .ebrk_insn_o        (dec_ebrk[l]),
       .mret_insn_o        (),
       .dret_insn_o        (),
       .ecall_insn_o       (),
@@ -448,7 +480,9 @@ module ibex_vliw_dispatch
   // =========================================================================
   // Bundle completion gating: a bundle is done when no lane is busy.
   // =========================================================================
-  assign all_lanes_done = bundle_active & ~(|lane_busy);
+  // Bundle completion gating (DESIGN.md §7.3): a bundle is done when no lane
+  // is busy AND at least one execute cycle has elapsed (bundle_active_q).
+  assign all_lanes_done = bundle_active & bundle_active_q & ~(|lane_busy);
 
   // =========================================================================
   // Resolved redirect: the lowest-indexed lane asserting a redirect wins.
@@ -483,6 +517,7 @@ module ibex_vliw_dispatch
   // Status / exceptions.
   // =========================================================================
   assign illegal_insn_o = |(dec_illegal & {W{bundle_active}});
-  assign busy_o         = bundle_active | fetch_enable_i;
+  assign busy_o         = (bundle_active | fetch_enable_i) & ~halted_q;
+  assign halted_o       = halted_q;
 
 endmodule

@@ -71,7 +71,16 @@ module ibex_bundle_cache
     assign a_addr  = bundle_word_idx;
     assign a_wdata = '0;
     assign a_wmask = {64{1'b1}};
-    assign fetch_slot_o[b] = a_rdata;
+    // prim_ram_2p registers its read: a_rdata is valid one cycle after a_req.
+    // Latch it into a_rdata_q on that cycle (when fetch_req_q asserts) so it
+    // holds stable for the whole bundle-execution window — without this, a
+    // new fetch request would overwrite a_rdata before the decoders consume it.
+    logic [63:0] a_rdata_q;
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+      if (!rst_ni)            a_rdata_q <= '0;
+      else if (fetch_req_q)   a_rdata_q <= a_rdata;
+    end
+    assign fetch_slot_o[b] = a_rdata_q;
 
     logic fill_bank_sel;
     assign fill_bank_sel = (fill_bank_i == $clog2(Width)'(b));
