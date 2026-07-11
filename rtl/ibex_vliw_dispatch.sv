@@ -325,24 +325,42 @@ module ibex_vliw_dispatch
   logic [W-1:0]            lsu_req, lsu_we, lsu_gnt, lsu_rvalid;
   logic [W-1:0][31:0]      lsu_addr, lsu_wdata, lsu_rdata;
 
+  // External bus between the LSU and the core boundary.
+  logic                       lsu_ext_req;
+  logic [31:0]                lsu_ext_addr;
+  logic                       lsu_ext_we;
+  logic [3:0]                 lsu_ext_be;
+  logic [DataWidth-1:0]       lsu_ext_wdata;
+  logic                       lsu_ext_gnt;
+  logic                       lsu_ext_rvalid;
+  logic [DataWidth-1:0]       lsu_ext_rdata;
+
   ibex_banked_lsumem #(
     .NumLanes     (W),
     .NumDataBanks (NumDataBanks),
     .BankDepth    (DataBankDepth),
     .DataWidth    (DataWidth)
   ) u_lsu (
-    .clk_i         (clk_i),
-    .rst_ni        (rst_ni),
-    .clk_sram_2x_i (clk_sram_2x_i),
-    .req_i         (lsu_req),
-    .we_i          (lsu_we),
-    .addr_i        (lsu_addr),
-    .wdata_i       (lsu_wdata),
-    .gnt_o         (lsu_gnt),
-    .rvalid_o      (lsu_rvalid),
-    .rdata_o       (lsu_rdata),
-    .cfg_i         (dmem_cfg_i),
-    .cfg_o         (dmem_cfg_o)
+    .clk_i            (clk_i),
+    .rst_ni           (rst_ni),
+    .clk_sram_2x_i    (clk_sram_2x_i),
+    .req_i            (lsu_req),
+    .we_i             (lsu_we),
+    .addr_i           (lsu_addr),
+    .wdata_i          (lsu_wdata),
+    .gnt_o            (lsu_gnt),
+    .rvalid_o         (lsu_rvalid),
+    .rdata_o          (lsu_rdata),
+    .ext_data_req_o   (lsu_ext_req),
+    .ext_data_addr_o  (lsu_ext_addr),
+    .ext_data_we_o    (lsu_ext_we),
+    .ext_data_be_o    (lsu_ext_be),
+    .ext_data_wdata_o (lsu_ext_wdata),
+    .ext_data_gnt_i   (lsu_ext_gnt),
+    .ext_data_rvalid_i(lsu_ext_rvalid),
+    .ext_data_rdata_i (lsu_ext_rdata),
+    .cfg_i            (dmem_cfg_i),
+    .cfg_o            (dmem_cfg_o)
   );
 
   // =========================================================================
@@ -448,13 +466,18 @@ module ibex_vliw_dispatch
   end
 
   // =========================================================================
-  // External data bus: quiescent (banked LSU serves all on-chip traffic).
+  // External data bus: driven by the banked LSU's external-fallback path for
+  // accesses outside the on-chip data memory (MMIO / external RAM). This is
+  // the core's external data_* bus.
   // =========================================================================
-  assign data_req_o    = 1'b0;
-  assign data_addr_o   = '0;
-  assign data_we_o     = 1'b0;
-  assign data_be_o     = 4'hF;
-  assign data_wdata_o  = '0;
+  assign data_req_o    = lsu_ext_req;
+  assign data_addr_o   = lsu_ext_addr;
+  assign data_we_o     = lsu_ext_we;
+  assign data_be_o     = lsu_ext_be;
+  assign data_wdata_o  = lsu_ext_wdata;
+  assign lsu_ext_gnt   = data_gnt_i;
+  assign lsu_ext_rvalid= data_rvalid_i;
+  assign lsu_ext_rdata = data_rdata_i;
 
   // =========================================================================
   // Status / exceptions.
