@@ -2,12 +2,14 @@
 
 > Companion to `DESIGN.md` (v3). The core is a **dynarec‑driven, 1000‑lane statically‑dispatched (VLIW)
 > engine**: the hardware does no scheduling and no branch prediction — the dynarec lays out every bundle
-> and resolves all control flow. This document answers two questions:
+> and resolves all control flow. This document answers four questions:
 >
 > 1. **What is the best algorithm for determining what can be scheduled in (VLIW) superscalar order?**
 > 2. **What is the best algorithm for assigning registers?**
+> 3. **When should a value be spilled to SRAM, and to which memory?** (§D)
+> 4. **How does allocation change when the engine is `N` clusters instead of one?** (§E)
 >
-> Both are answered for *this* machine specifically — exposed memory latency, 1024‑bank ARF with a bank
+> All four are answered for *this* machine specifically — exposed memory latency, 1024‑bank ARF with a bank
 > constraint, a separate ARF‑slot address class, predication instead of branches, and a target workload of
 > pointer‑chasing loops.
 
@@ -493,7 +495,8 @@ The two serious candidates:
 3. **Sweep**, keeping active live ranges in a priority structure keyed by end bundle:
    - On a new range starting: free any expired ranges (end < now) back to the free pool of GPRs; assign
      the new range a free GPR. If none free, **spill** the range whose end is farthest in the future
-     (spill to the stack via normal `sw`/`lw`; the ARF is not a spill target for data).
+     (Belady's rule — optimal on a fixed schedule; the *target* is chosen by the two-tier policy of §D:
+     an ARF scratch slot via `slotw`, or the stack via `sw`/`lw` for long distances).
    - On a range ending: free its GPR.
 4. **Insert moves at SSA φ‑block boundaries** (the standard split‑edge move insertion; on this machine a
    move is one lane op, easily co‑scheduled).
@@ -562,7 +565,7 @@ is the same one §A.4's prefix‑sum needs.
 
 | Class | Algorithm | Spills? | Notes |
 |---|---|---|---|
-| Data GPRs | **Linear scan on SSA** (§B.2), *after* scheduling (§B.3) | yes, to stack; keep live‑set small by leaving addresses in ARF | `O(n log n)`; production‑JIT quality |
+| Data GPRs | **Linear scan on SSA** (§B.2), *after* scheduling (§B.3) | yes — per §D (remat → ARF scratch → stack); keep live‑set small by leaving addresses in ARF | `O(n log n)`; production‑JIT quality |
 | Address ARF slots | **Bank‑aware placement** (§B.4): precolor PINNED; first‑fit bank‑color the co‑bundle interference graph | ~never (~122K free slots) | satisfiable iff `W ≤ #banks` (instance: 32 ≤ 64); dedicated‑slot‑per‑walk is the simple policy |
 
 ---
@@ -602,7 +605,137 @@ wide engine's value is entirely in the multi‑stream case above.
 
 ---
 
-## D. Knobs and open questions
+## D. Spilling to SRAM: when and what
+
+This section resolves the open knob (§F) into the concrete spill policy §B.2 defers to: when to spill at
+all, which value, and to which memory. Three machine-specific facts shape the answer:
+
+- **The schedule is fixed when the allocator runs** (§B.3), so every value's def and use bundles are known
+  exactly. Spill choice on a fixed schedule is the paging problem, whose optimal victim is **furthest next
+  use** (Belady 1966) — optimal for a fixed reference string with uniform replacement cost. Linear scan's
+  stock heuristic (spill the active range with the latest end) approximates Belady; on SSA with use lists
+  the dynarec computes the exact next-use distance, so it can run *literal* Belady — a luxury no dynamic
+  machine has, because its use distances are estimates.
+- **Spill cost is a two-tier latency hierarchy, not a constant.** Tier 1: an ARF free-pool slot used as a
+  data scratch via `slotw`/`slotr`. This is the deliberate widening of the "addresses only" rule (DESIGN.md
+  §4.1), and it is safe: scratch slots never alias architecturally visible memory, so the no-coherence
+  property (DESIGN.md §5.4) is untouched — the dynarec must simply never *use* a scratch value as an
+  address. Cost: 1 bundle for the store, 1 for the reload — but both are ARF-touching ops that must satisfy
+  the bank rule (DESIGN.md §4.4) in their bundles. Tier 2: the stack via `sw`/`lw`. The store costs an LSU
+  port; the reload costs an LSU port and must issue `Lmem` bundles before the use to be free.
+- **Lanes are abundant; bank slots and LSU ports are scarce.** Bundles are rarely full (§A.5.5), so a spare
+  lane costs ~nothing. This inverts the classic spill-vs-rematerialize trade.
+
+### D.1 The algorithm: remat-first, Belady victim, admission-controlled insertion
+
+When the §B.2 sweep needs a GPR and none is free:
+
+1. **Rematerialize before spilling anything.** If any candidate value is recomputable in the consumer's
+   bundle from values live there — constants, 1-latency ALU functions of live values, or a re-`ldp` of a
+   pinned slot (the address is already in the ARF, so the re-load needs no address remat) — drop the value
+   and re-issue the defining op at the use. Remat spends the cheap resource (a lane) instead of the scarce
+   ones (bank slots, LSU ports); on this machine it outranks spilling, not the other way around.
+2. **Pick the victim by furthest next use (Belady), with admission-aware tie-breaks.** Compute `d(v)` =
+   distance to next use for each active range; spill max `d(v)`. Tie-break toward: (a) clean values (a copy
+   already exists — no store needed), (b) values whose reload bundle has a free ARF bank slot (a tier-1
+   reload can't force a reschedule), (c) load-defined values (rematerializable per step 1, so spilling them
+   is free).
+3. **Pick the tier by distance.** If the use is ≥ `Lmem` bundles away and some bundle in `[now, use−Lmem]`
+   has a free LSU port → **tier 2 (stack)**, and place the reload *early* at the first such bundle, so the
+   memory latency is hidden off the critical path. Otherwise → **tier 1 (ARF scratch)**.
+4. **Insert; don't reschedule.** The store needs a free lane (and, tier 1, a free bank slot) in the current
+   bundle; the reload needs its slot/port in its bundle. Both are ARF-/LSU-touching ops and join the §B.4
+   co-bundle coloring — the `2·W` bank margin (DESIGN.md §4.4) exists partly to absorb them. If the target
+   bundle is full, take the next bundle with room for a store, or the nearest earlier legal bundle for a
+   reload. Only when even that fails does §B.3's single re-schedule pass fire — capped, per §F.
+
+### D.2 What is provable, what is heuristic
+
+- Single tier, uniform cost, fixed schedule: furthest-next-use is **optimal** (Belady 1966). A dynarec gets
+  to run a provably optimal memory algorithm because the future is known.
+- Two tiers + bank/LSU admission + remat interact into an NP-hard whole (it contains resource-constrained
+  scheduling). The policy above is the standard near-optimal practical form, and spill volume is low here
+  anyway: addresses never enter the GPR file (§B.1), so only data pressure spills, and the free pool
+  (~122K slots) makes tier-1 exhaustion a non-event.
+
+---
+
+## E. Multi-cluster: cycle-aware allocation across N clusters
+
+The multi-cluster build (DESIGN.md §13, "Multi-cluster variant") replicates the §7 engine `N` times: each
+cluster has its own `W` lanes, GPRs, ARF (`#banks ≥ W`), instruction banks, and data partition, and a
+pipelined interconnect moves a 32-bit word between clusters in a fixed, exposed `Lhop` bundles. `Lhop` is a
+compile-time constant, like `Lmem` — which is why this section is short: **everything the scheduler already
+does with `Lmem`, it does with `Lhop`, unchanged.**
+
+### E.1 Partition first: the fused DDG already names the clusters
+
+Cluster assignment happens between region formation (§A.2) and scheduling (§A.5), on the DDG:
+
+1. **Atoms = connected components.** After horizontal trace fusion the DDG is `k` mostly-disconnected stream
+   components (§C). Components are the atoms — never split one stream's chain across clusters: its
+   `ldp.next` recurrence would pay `Lhop` per advance, the §A.3 RecMII bound with a worse constant. (The §C
+   worked example scales verbatim: fuse `k = N·W` streams, place `W` per cluster; each cluster's bundle 0
+   holds its own `W` `ldp.next` roots.)
+2. **Balanced assignment: LPT bin-packing.** Sort components by op count, place each on the least-loaded
+   cluster — O(k log k), within 4/3 of optimal makespan (Graham 1969), and balance only needs to be loose
+   (±10%) because clusters don't gate each other (DESIGN.md §13, caveat 3). Placement constraints: the
+   cluster's ARF working set ≤ its free pool; its stream count ≤ its data banks.
+3. **Cut refinement: greedy migration.** Where components interact (joins, reductions), repeatedly move the
+   component whose migration most reduces Σ cut-edge weights (values crossing × uses), until no improvement
+   — Kernighan–Lin truncated to one linear-ish pass, per the runtime budget (§0). The result is a local
+   optimum of an objective (transfer traffic) that is itself an approximation of schedule length; do not
+   spend more here.
+
+### E.2 Transfers are DDG nodes: the scheduler does not change
+
+Split every cut edge producer `p` (cluster `c_p`) → consumer `q` (cluster `c_q`) mechanically:
+
+```
+p @ c_p ──1──▶ send @ c_p ──Lhop──▶ recv @ c_q ──1──▶ q @ c_q
+```
+
+- `send` occupies a lane in `c_p`; `recv` occupies a lane in `c_q`, `Lhop` bundles later; the link itself is
+  a scalar capacity (≤ words/link/bundle) that composes by `max` exactly like the predicate ports of §A.4.6.
+- In the online hash scheduler (§A.5) the change is one line: after placing `send` in bundle `b`, record
+  `M[key] = b + Lhop` **in `c_q`'s map**. The consumer then lands at `≥ b + Lhop + 1` by the ordinary
+  lookup — the §A.4.1 latency-slotting fall-out, applied to a second latency class. Each cluster keeps its
+  own bundle list, its own `M`, its own linear scan (§B.2), its own §B.4 bank coloring under its own
+  `#banks ≥ W` precondition.
+- **Cycle-aware by construction.** The allocator knows, for every cluster and every bundle, the exact
+  lane/bank/link occupancy, because it placed every op. A received value's live range starts at its `recv`
+  bundle (it is a def there); a value needed in `j` clusters is sent `j` times and holds a register in each,
+  which the partitioner prices as cut weight.
+
+### E.3 Allocation consequences
+
+- **A walk never migrates mid-trace.** Its state is a slot in one cluster's ARF; moving it costs a transfer
+  of the contents plus `spalloc`/`spfree` (≈ `Lhop` + 2 bundles) and buys nothing, because streams are
+  long-lived and the partition was balanced. Walk→cluster assignment is fixed at trace entry; re-partition
+  on re-translation (a deopt event), never mid-trace.
+- **Spilling gains a third tier.** The §D hierarchy becomes: local ARF scratch (1 bundle) < remote ARF
+  scratch (`Lhop` + 1 — a `slotw` forwarded over the interconnect) < stack (`Lmem`). Victim selection and
+  admission control are unchanged; the remote tier is the overflow valve that lets the allocator degrade
+  instead of fail. It should fire ~never: each cluster's free pool is ~122K/`N` slots against a working set
+  of thousands.
+- **There is no cross-cluster ARF access.** `ldp`/`stp`/`ldp.next` address only the local ARF. An address
+  value needed in another cluster moves as data over the interconnect and is written into a local slot on
+  the receive side (`slotw`/`pina`). The §4.4 bank rule stays a purely local property: per-cluster coloring,
+  no global coordination.
+
+### E.4 What is provable, what is heuristic
+
+- Joint partition + schedule + allocation is NP-hard (it contains graph partitioning). The pipeline above —
+  partition, then per-cluster §A.5 + §B — is the standard decomposition; each stage is a near-linear
+  heuristic from this document.
+- **The approximation lives in the partition, not in the cycle accounting.** With the partition fixed, each
+  per-cluster schedule is exactly as good as §A.5 on the same ops, because `Lhop` enters as ordinary
+  weighted edges and per-cluster resources are independent. LPT is within 4/3 of optimal balance; greedy
+  migration is a local optimum. Nothing in §A/§B weakens.
+
+---
+
+## F. Knobs and open questions
 
 - **`Lmem` assumption.** Scheduling quality depends on the dynarec's `Lmem` being accurate. If memory
   latency is variable (banked SRAM with contention), the dynarec should schedule to a conservative
@@ -612,9 +745,9 @@ wide engine's value is entirely in the multi‑stream case above.
   single biggest scheduler knob for this workload. Too little → 1‑wide; too much → huge superblocks with
   poor I‑cache locality and imbalance (one long list gating many short ones). A length‑bounded,
   bank‑aware fusion is the starting point.
-- **Spill policy for data GPRs.** With addresses out of the GPR file, data pressure is the only spill
-  source. If it bites, the natural extra spill target is a small set of ARF slots used as a data scratch
-  (a deliberate widening of the "addresses only" rule, gated by the dynarec, not the hardware).
+- **Spill policy for data GPRs.** **Resolved — see §D**: remat-first, Belady victim selection, and a tiered
+  target (local ARF scratch → remote ARF → stack). With addresses out of the GPR file, data pressure is the
+  only spill source.
 - **Re‑scheduling on spill.** §B.3's re‑schedule pass is the main place translation cost can blow up; cap
   it (e.g., one re‑schedule, else accept the spill) to keep dynarec latency bounded.
 - **Quality vs. translation speed.** List scheduling + linear scan + bank placement are all

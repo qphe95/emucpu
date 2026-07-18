@@ -513,7 +513,8 @@ fewer ops per bundle.
 single slow load can stall all `W` lanes (classic VLIW memory‑stall exposure). Mitigations: (a) the dynarec
 schedules consumers `Lmem` later so latency is hidden across bundles; (b) keep each bundle's loads on
 independent chains; (c) optionally split the engine into a few independent sub‑engines that don't gate each
-other (a middle ground between full lockstep and full OoO). This is the design's central performance risk.
+other (a middle ground between full lockstep and full OoO) — the `N × W = 32` multi-cluster variant of §13 is
+exactly this split. This is the design's central performance risk.
 
 **Restored, not lost: the mispredict property.** v2 reintroduced a large mispredict penalty. v3 **removes
 misprediction entirely** — there is no predictor to be wrong. Branches are resolved in‑place (§3.1) and
@@ -621,6 +622,47 @@ prefix‑sum scheduler to be valid and the bank constraint to be satisfiable by 
 **Bring‑up ladder.** `W = 1` (single‑lane, in‑order, proves ARF + custom ISA) → `W = 8` (proves banking,
 predication, double‑clock) → **`W = 32`** (the target instance) → `W = 64` (stretch, if timing closes).
 Each step is a parameter change, not a redesign.
+
+**Multi-cluster variant (`N × W = 32`).** A single `W = 32` cluster is not the part's ceiling — lane logic is
+only ~8% of the LUTs; the ceilings are BRAM geometry and the lane↔bank crossbar. The alternative to the
+monolithic `W = 64` stretch is `N` independent clusters of `W = 32`, each with its own lanes, GPRs, ARF,
+instruction banks, and data-memory partition, plus a pipelined interconnect with a fixed, exposed hop latency
+`Lhop` for cross-cluster traffic. The dynarec schedules `Lhop` exactly like `Lmem` (DYNAREC.md §E). ARF
+geometry follows the §4.1 rule that one bank = one 36 Kb block at full depth (1024 × 32 per block):
+
+| Config | ARF blocks (geometry) | Instr blocks | Data mem | Total / 480 | Bank margin |
+|---|---|---|---|---|---|
+| 1 × W32 (this §) | 128 (64 banks × 2048) | ~64 | ~200 | 392 | `#banks = 2·W` ✓ |
+| 2 × W32 | 128 (2 × 64 banks × 1024) | 2 × 32 | ~200 | 392 | `2·W` ✓ — identical footprint to one cluster |
+| 3 × W32 | 96 (3 × 32 banks × 1024) | 3 × 32 | ~200 | 392 | `#banks = W` exactly |
+| 4 × W32 | 128 (4 × 32 banks × 1024) | 4 × 32 | ~200 | 456 | `#banks = W` exactly |
+
+Instruction banks are quoted at minimum geometry (one dual-port block per lane → 64 reads/cycle of headroom,
+§7.2.1); doubling for code depth costs 32 blocks/cluster (`N = 2` still fits, at 456). LUT cost stays modest:
+~10–14K per incremental cluster (32 lanes + a 32×64 crossbar + LSU ports) on top of the shared
+controller/decode — 4 clusters ≈ 25% of the part. The one `clk_sram_2x` PLL serves all clusters.
+
+Three structural caveats, in order of importance:
+
+1. **The data memory decides whether clustering helps.** Throughput is still `min(lanes, data_mem_banks)`
+   (§9) — clusters multiply lanes, not memory concurrency. Partition the data banks per cluster and keep
+   walks partition-local (a remote walk crosses the interconnect at `Lhop`). Do **not** build a shared
+   `(N·W) × #banks` crossbar: that is the O(W²) congestion that ruled out monolithic `W = 128`, re-introduced
+   one level up.
+2. **BRAM granularity is per bank, not per bit.** Every bank costs a whole 36 Kb block even when shallow, so
+   `N = 3` drops aggregate ARF capacity to 96K entries (2048/3 isn't integral) and `N = 4` fits only at
+   `#banks = W` with no `2·W` bank-coloring margin (DYNAREC.md §A.4.5 / §B.4). `N = 2` is the sweet spot:
+   identical 392-block footprint, full margin, no capacity loss.
+3. **Bundle gating improves.** A slow load gates only its own cluster's bundle; the other clusters keep
+   dispatching — the §11 "independent sub-engines" mitigation falls out of the cluster model for free. A
+   consumer waiting on an `Lhop` transfer from a gated cluster inherits the gate through the dependence
+   edge (correct — a true dependence — not a new hazard).
+
+**2 × W32 vs. the monolithic W = 64 stretch.** Same 64 lanes. The clustered form replaces one hostile 64×128
+crossbar with two friendly 32×64 ones and keeps the bank margin; the monolith keeps a flat memory model with
+no `Lhop` traffic. Run both through P&R before committing Phase 5's stretch goal (§12) — if the monolith
+misses timing, clusters still deliver the lanes. The dynarec side (stream-level partitioning, transfer
+insertion, spill tiers) is specified in DYNAREC.md §E.
 
 ---
 
